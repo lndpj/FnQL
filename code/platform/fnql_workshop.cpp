@@ -166,7 +166,7 @@ void SetManualProgress(std::uint64_t itemId) {
 	Cvar_Set("cl_downloadName", "Workshop item 1 of 1");
 	Cvar_Set("cl_downloadCount", "0");
 	Cvar_Set("cl_downloadSize", "0");
-	Cvar_SetIntegerValue("cl_downloadTime", Com_Milliseconds());
+	Cvar_SetIntegerValue("cl_downloadTime", Sys_Milliseconds());
 }
 
 void RefreshManualProgress() {
@@ -277,7 +277,7 @@ SnapshotRefreshResult RefreshSubscribedSnapshot(bool restartFilesystem) {
 }
 
 void ScheduleSnapshotRefresh(bool restartFilesystem, std::uint32_t delayMsec) {
-	const std::uint32_t now = static_cast<std::uint32_t>(Com_Milliseconds());
+	const std::uint32_t now = static_cast<std::uint32_t>(Sys_Milliseconds());
 	const std::uint32_t scheduledAt = now + delayMsec;
 	if (snapshotRefresh.fallbackPoll) {
 		snapshotRefresh = {};
@@ -296,7 +296,7 @@ void ScheduleFallbackSnapshotPoll(std::uint32_t delayMsec) {
 	if (snapshotRefresh.active) {
 		return;
 	}
-	const std::uint32_t now = static_cast<std::uint32_t>(Com_Milliseconds());
+	const std::uint32_t now = static_cast<std::uint32_t>(Sys_Milliseconds());
 	snapshotRefresh.active = true;
 	snapshotRefresh.fallbackPoll = true;
 	snapshotRefresh.restartFilesystem = true;
@@ -313,7 +313,7 @@ bool CanTrackSubscriptionAction(std::uint64_t itemId) {
 
 void ScheduleSubscriptionRefresh(std::uint64_t itemId,
 	SubscriptionAction action) {
-	const std::uint32_t now = static_cast<std::uint32_t>(Com_Milliseconds());
+	const std::uint32_t now = static_cast<std::uint32_t>(Sys_Milliseconds());
 	PendingSubscriptionAction *slot = nullptr;
 	for (PendingSubscriptionAction &pending : pendingSubscriptionActions) {
 		if (pending.active && pending.itemId == itemId) {
@@ -449,7 +449,7 @@ void Com_WorkshopFrame(void) {
 	if (!workshopInitialized) {
 		return;
 	}
-	const std::uint32_t now = static_cast<std::uint32_t>(Com_Milliseconds());
+	const std::uint32_t now = static_cast<std::uint32_t>(Sys_Milliseconds());
 	for (PendingSubscriptionAction &pending : pendingSubscriptionActions) {
 		if (!pending.active || !pending.nextAt
 			|| static_cast<std::int32_t>(now - pending.nextAt) < 0) {
@@ -558,7 +558,7 @@ qboolean Com_WorkshopDownloadItem(std::uint64_t itemId) {
 		Com_Printf("Workshop item %llu: in cache.\n",
 			static_cast<unsigned long long>(itemId));
 		manualDownload.itemId = itemId;
-		manualDownload.startedAt = static_cast<std::uint32_t>(Com_Milliseconds());
+		manualDownload.startedAt = static_cast<std::uint32_t>(Sys_Milliseconds());
 		manualDownload.active = true;
 		SetManualProgress(itemId);
 		return (FinishManualDownload() || manualDownload.active) ? qtrue : qfalse;
@@ -569,7 +569,7 @@ qboolean Com_WorkshopDownloadItem(std::uint64_t itemId) {
 		return qfalse;
 	}
 	manualDownload.itemId = itemId;
-	manualDownload.startedAt = static_cast<std::uint32_t>(Com_Milliseconds());
+	manualDownload.startedAt = static_cast<std::uint32_t>(Sys_Milliseconds());
 	manualDownload.active = true;
 	SetManualProgress(itemId);
 	Com_Printf("Workshop item %llu: requesting download.\n",

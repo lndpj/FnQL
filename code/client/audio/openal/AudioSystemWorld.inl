@@ -1264,7 +1264,7 @@ void Q3SoundWorld::StartSound( int entityNum, int entchannel, sfxHandle_t handle
 		Com_Error( ERR_DROP, "S_StartSound: bad entitynum %i", entityNum );
 	}
 
-	const int startTime = Com_Milliseconds();
+	const int startTime = Sys_Milliseconds();
 
 	if ( entityNum != ENTITYNUM_WORLD ) {
 		for ( SoundVoice &voice : oneShots_ ) {
@@ -1367,7 +1367,7 @@ void Q3SoundWorld::UpdateEntityPosition( int entityNum, const float *origin ) {
 }
 
 void Q3SoundWorld::Respatialize( int entityNum, const float *origin, float axis[3][3] ) {
-	const int now = Com_Milliseconds();
+	const int now = Sys_Milliseconds();
 	float velocity[3];
 	int elapsedMs = 0;
 
@@ -1440,7 +1440,7 @@ void Q3SoundWorld::RefreshEnvironment() {
 		return;
 	}
 
-	const int now = Com_Milliseconds();
+	const int now = Sys_Milliseconds();
 	if ( RefreshAudioZonesForCurrentMap() ) {
 		nextEnvironmentProbeTime_ = 0;
 	}
@@ -1495,7 +1495,7 @@ void Q3SoundWorld::UpdateVoiceEnvironment( SoundVoice &voice, const float *voice
 		return;
 	}
 
-	const int now = Com_Milliseconds();
+	const int now = Sys_Milliseconds();
 	if ( now < voice.nextEnvironmentUpdateTime ) {
 		return;
 	}
@@ -1563,7 +1563,7 @@ void Q3SoundWorld::ApplyVoice( SoundVoice &voice, qboolean softMuted ) {
 	float wetGainHF = environment_.wetHF;
 	float pitch = 1.0f;
 	float occlusion = 0.0f;
-	const int now = Com_Milliseconds();
+	const int now = Sys_Milliseconds();
 
 	if ( stereoSample ) {
 		spatial.pan = 0.0f;

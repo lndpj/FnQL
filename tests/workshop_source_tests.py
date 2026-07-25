@@ -667,7 +667,7 @@ class WorkshopCommonBehaviorTests(unittest.TestCase):
 #include <cstdint>
 
 static int fakeMilliseconds;
-static int Com_Milliseconds() { return fakeMilliseconds; }
+static int Sys_Milliseconds() { return fakeMilliseconds; }
 
 """ + type_fragments + r"""
 
@@ -1169,7 +1169,9 @@ class WorkshopLifecycleAndBuildSourceTests(unittest.TestCase):
             self,
             pump,
             "state.provider->run_callbacks();",
-            "Com_Milliseconds()",
+            # Sys_Milliseconds() is the plain timer; Com_Milliseconds() pumps the
+            # OS event queue and must never run on the per-frame pump path.
+            "Sys_Milliseconds()",
             "state.nextCapabilityRefresh",
             'RefreshProviderCapabilities("the callback pump")',
             "state.nextCapabilityRefresh = now + 1000u",

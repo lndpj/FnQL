@@ -1221,6 +1221,9 @@ test('fnql_join_menu_source', python,
 test('fnql_windowed_mouse_source', python,
   args: files('tests/windowed_mouse_source_tests.py'),
 )
+test('fnql_frame_clock_source', python,
+  args: files('tests/frame_clock_source_tests.py'),
+)
 test('fnql_platform_port_safety_source', python,
   args: files('tests/platform_port_safety_tests.py'),
 )

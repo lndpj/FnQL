@@ -2953,7 +2953,16 @@ int Com_EventLoop( void ) {
 ================
 Com_Milliseconds
 
-Can be used for profiling, but will be journaled accurately
+Can be used for profiling, but will be journaled accurately.
+
+This is NOT a cheap clock. Draining the queue calls Sys_SendKeyEvents(), which
+pumps the platform message loop; on Windows a single pump can block for several
+milliseconds even when it produces no events, because the windowing and input
+backends do their own device and window bookkeeping there. The returned value is
+just the Sys_Milliseconds() sample taken by the terminating null event, so any
+caller that only wants the current time must call Sys_Milliseconds() directly.
+Reserve this for the main event loop and for journaled one-shot timestamps;
+calling it from per-frame or per-object code reintroduces frame hitches.
 ================
 */
 int Com_Milliseconds( void ) {

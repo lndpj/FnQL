@@ -167,7 +167,7 @@ void FNQL_STEAM_CALL HostEvent(void *, const fnqlSteamEvent_t *event) {
 }
 
 uint64_t FNQL_STEAM_CALL HostMilliseconds(void *) {
-	return static_cast<uint64_t>(Com_Milliseconds());
+	return static_cast<uint64_t>(Sys_Milliseconds());
 }
 
 void BuildCandidatePaths(const char *configured,
@@ -654,7 +654,7 @@ void FNQL_Steam_Pump(void) {
 	/* A GameServer-owned interface can become available on a callback-driven
 	 * transition. Refresh before common Workshop polling consumes this frame,
 	 * while keeping routine status probes bounded to once per second. */
-	const uint32_t now = static_cast<uint32_t>(Com_Milliseconds());
+	const uint32_t now = static_cast<uint32_t>(Sys_Milliseconds());
 	if (!state.nextCapabilityRefresh
 		|| static_cast<int32_t>(now - state.nextCapabilityRefresh) >= 0) {
 		RefreshProviderCapabilities("the callback pump");

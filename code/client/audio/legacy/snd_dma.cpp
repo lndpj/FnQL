@@ -190,7 +190,7 @@ static void S_Base_AddVoiceSamples( int clientNum, int samples, int rate, const 
 		activity[i] = s_voiceLanes[i].activity;
 	}
 
-	const int now = Com_Milliseconds();
+	const int now = Sys_Milliseconds();
 	const int laneIndex = fnql_audio_voice::SelectLane( activity.data(), static_cast<int>( activity.size() ), clientNum, now );
 	if ( laneIndex < 0 ) {
 		Com_DPrintf( "S_AddVoiceSamples: all remote-voice lanes are busy; dropping client %i packet\n", clientNum );
@@ -1399,7 +1399,7 @@ static void S_Update_( int msec ) {
 		return;
 	}
 
-	thisTime = Com_Milliseconds();
+	thisTime = Sys_Milliseconds();
 
 	// Updates s_soundtime
 	S_GetSoundtime();

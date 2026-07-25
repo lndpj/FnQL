@@ -282,7 +282,7 @@ static bool StartNextDownload() {
 		workshopQueue.callbackFailure = false;
 		workshopQueue.callbackCompletionHint = false;
 		workshopQueue.activeStartedAt =
-			static_cast<std::uint32_t>( Com_Milliseconds() );
+			static_cast<std::uint32_t>( Sys_Milliseconds() );
 		workshopQueue.phase = QueuePhase::Downloading;
 		item.disposition = ItemDisposition::Downloading;
 		SetProgressItem( i );
@@ -531,7 +531,7 @@ void CL_Workshop_Frame( void ) {
 		}
 		return;
 	}
-	const std::uint32_t now = static_cast<std::uint32_t>( Com_Milliseconds() );
+	const std::uint32_t now = static_cast<std::uint32_t>( Sys_Milliseconds() );
 	if ( static_cast<std::uint32_t>( now - workshopQueue.activeStartedAt )
 		>= kDownloadTimeoutMsec ) {
 		Com_Printf( S_COLOR_YELLOW

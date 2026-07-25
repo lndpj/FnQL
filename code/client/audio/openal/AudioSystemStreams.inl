@@ -272,7 +272,7 @@ void VoiceChatPlayer::Queue( int clientNum, int frameCount, int sampleRate, cons
 		activity[static_cast<size_t>( i )] = lane.activity;
 	}
 
-	const int now = Com_Milliseconds();
+	const int now = Sys_Milliseconds();
 	const int laneIndex = fnql_audio_voice::SelectLane( activity.data(), laneCount_, clientNum, now );
 	if ( laneIndex < 0 ) {
 		Com_DPrintf( "OpenAL remote voice: all lanes are busy; dropping client %i packet\n", clientNum );
@@ -312,7 +312,7 @@ void VoiceChatPlayer::Queue( int clientNum, int frameCount, int sampleRate, cons
 }
 
 void VoiceChatPlayer::Update( float gain ) {
-	const int now = Com_Milliseconds();
+	const int now = Sys_Milliseconds();
 	for ( int i = 0; i < laneCount_; ++i ) {
 		Lane &lane = lanes_[static_cast<size_t>( i )];
 		const bool allowStart = lane.player.QueuedBufferCount() >= 2 ||
