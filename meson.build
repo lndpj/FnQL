@@ -1191,6 +1191,20 @@ collision_model_parity_tests = executable('fnql_collision_model_parity_tests',
   cpp_args: common_cpp_args,
 )
 test('fnql_collision_model_parity', collision_model_parity_tests)
+
+# Links the real trace path against a stub collision model so the capsule
+# geometry and the debug trace-plane invariant are exercised, not just
+# described.
+collision_capsule_trace_tests = executable('fnql_collision_capsule_trace_tests',
+  [
+    'tests/collision_capsule_trace_tests.c',
+    'code/qcommon/cm_trace.c',
+    'code/qcommon/q_math.c',
+  ],
+  include_directories: include_directories('code/qcommon'),
+  c_args: common_c_args,
+)
+test('fnql_collision_capsule_trace', collision_capsule_trace_tests)
 test('fnql_collision_model_parity_source', python,
   args: files('tests/collision_model_parity_source_tests.py'),
 )

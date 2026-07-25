@@ -29,6 +29,7 @@ class CollisionModelParitySourceTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.load = read("code/qcommon/cm_load.c")
         cls.trace = read("code/qcommon/cm_trace.c")
+        cls.contract = read("code/qcommon/cm_trace_contract.h")
         cls.surfaceflags = read("code/qcommon/surfaceflags.h")
         cls.world = read("code/server/sv_world.cpp")
         cls.game = read("code/server/sv_game.cpp")
@@ -72,41 +73,89 @@ class CollisionModelParitySourceTests(unittest.TestCase):
         combined = self.world + self.game
         self.assertNotRegex(combined, r"SV_ClipHandleForEntity\(\s*\w+\s*\)")
 
-    def test_retail_capsule_body_and_head_trace_are_preserved(self) -> None:
+    def test_capsule_sweep_keeps_both_cap_spheres(self) -> None:
+        """QL sweeps a cylinder capped by a sphere at each end.
+
+        Dropping either cap lets a moving capsule pass through the target
+        from below or above, so both sphere sweeps have to stay.
+        """
         capsule_trace = function_body(
             self.trace,
             "static void CM_TraceCapsuleThroughCapsule(",
         )
-        self.assertIn("CM_BuildRetailCapsuleProfile(", capsule_trace)
-        self.assertIn("CM_TraceThroughVerticalCylinder(", capsule_trace)
-        self.assertIn("CM_TraceThroughSphere(", capsule_trace)
+        self.assertIn("CM_BuildCapsuleTraceProfile(", capsule_trace)
+        self.assertEqual(capsule_trace.count("CM_TraceThroughSphere("), 2)
+        self.assertIn("profile.topSphere", capsule_trace)
+        self.assertIn("profile.bottomSphere", capsule_trace)
+        self.assertIn("startbottom", capsule_trace)
+        self.assertIn("endtop", capsule_trace)
+        # The cylinder section is only swept when it exists and can be entered.
+        self.assertEqual(
+            capsule_trace.count("CM_TraceThroughVerticalCylinder("), 1
+        )
+        self.assertIn("profile.cylinderHalfheight > 0", capsule_trace)
         self.assertIn(
-            "tw->trace.contents = CM_RetailCapsuleHitContents(",
+            "tw->start[0] != tw->end[0] || tw->start[1] != tw->end[1]",
             capsule_trace,
         )
-        self.assertNotIn("startbottom", capsule_trace)
-        self.assertRegex(
-            self.surfaceflags,
-            re.compile(r"#define CONTENTS_HEAD\s+0x0400"),
-        )
+        # The engine adds no head-hit metadata; QL leaves 0x0400 unallocated.
+        self.assertNotIn("CONTENTS_HEAD", self.surfaceflags)
+        self.assertNotIn("CONTENTS_HEAD", self.trace)
+        self.assertNotIn("CONTENTS_HEAD", self.contract)
 
-    def test_retail_cylinder_scale_and_zero_fraction_contract_are_preserved(
-        self,
-    ) -> None:
+    def test_retail_cylinder_scale_is_preserved(self) -> None:
         cylinder_trace = function_body(
             self.trace,
             "static void CM_TraceThroughVerticalCylinder(",
         )
         self.assertIn('"sv_cylinderScale", "1.1f"', cylinder_trace)
         self.assertIn("radius *= cylinderScale->value", cylinder_trace)
+
+    def test_plane_invariant_matches_the_producing_path(self) -> None:
+        """Only stored BSP planes are unit.
+
+        The analytic capsule plane is scaled by 1/(radius + RADIUS_EPSILON)
+        in single precision, so a debug build must not assert unit length on
+        that path.
+        """
         core_trace = function_body(
             self.trace,
             "static void CM_Trace( trace_t *results,",
         )
         self.assertIn(
-            "CM_TraceResultHasValidPlaneContract( &tw.trace )",
+            "CM_ValidateTraceResult( &tw.trace, planeSource )",
             core_trace,
         )
+        self.assertRegex(
+            core_trace,
+            re.compile(
+                r"cm_tracePlaneSource_t\s+planeSource\s*=\s*"
+                r"CM_TRACE_PLANE_STORED;"
+            ),
+        )
+        # Every capsule-vs-capsule dispatch has to declare the analytic plane.
+        analytic = re.findall(
+            r"planeSource = CM_TRACE_PLANE_ANALYTIC;\s*\n\s*"
+            r"(CM_TestCapsuleInCapsule|CM_TraceCapsuleThroughCapsule)\(",
+            self.trace,
+        )
+        self.assertEqual(len(analytic), 4)
+        for call in ("CM_TestCapsuleInCapsule(", "CM_TraceCapsuleThroughCapsule("):
+            self.assertEqual(self.trace.count(call), 3)
+
+        validator = function_body(
+            self.trace,
+            "static ID_INLINE void CM_ValidateTraceResult(",
+        )
+        self.assertIn(
+            "CM_TraceResultHasValidPlaneContract( trace, source )",
+            validator,
+        )
+        self.assertIn("assert( valid );", validator)
+        self.assertIn("(void)source;", validator)
+        # A bare assert dialog names no state, so report the trace first.
+        self.assertIn("#ifndef NDEBUG", validator)
+        self.assertIn("Com_Printf(", validator)
 
 
 if __name__ == "__main__":

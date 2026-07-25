@@ -940,9 +940,8 @@ capsule vs. capsule collision (not rotated)
 */
 static void CM_TraceCapsuleThroughCapsule( traceWork_t *tw, clipHandle_t model ) {
 	vec3_t mins, maxs;
-	cm_retailCapsuleProfile_t profile;
-	float bodyFraction = 1.0f;
-	float headFraction = 1.0f;
+	vec3_t starttop, startbottom, endtop, endbottom;
+	cm_capsuleProfile_t profile;
 
 	CM_ModelBounds(model, mins, maxs);
 	// test trace bounds vs. capsule bounds
@@ -956,30 +955,31 @@ static void CM_TraceCapsuleThroughCapsule( traceWork_t *tw, clipHandle_t model )
 		return;
 	}
 
-	/*
-	 * Retail QL does not use the inherited two-ended capsule sweep here.
-	 * It traces the moving capsule center through an expanded body cylinder,
-	 * then through a reduced sphere at the target's head.  The nearer head
-	 * contact is reported through trace.contents for the retail game module.
-	 */
-	CM_BuildRetailCapsuleProfile(
-		mins, maxs, tw->sphere.radius, &profile );
+	// top origin and bottom origin of each sphere at start and end of trace
+	VectorAdd(tw->start, tw->sphere.offset, starttop);
+	VectorSubtract(tw->start, tw->sphere.offset, startbottom);
+	VectorAdd(tw->end, tw->sphere.offset, endtop);
+	VectorSubtract(tw->end, tw->sphere.offset, endbottom);
 
-	CM_TraceThroughVerticalCylinder(
-		tw, profile.bodyOrigin, profile.bodyRadius,
-		profile.bodyHalfheight, tw->start, tw->end );
-	if ( tw->trace.contents & CONTENTS_BODY ) {
-		bodyFraction = tw->trace.fraction;
+	// calculate the cylinder and the cap spheres to collide with
+	CM_BuildCapsuleTraceProfile( mins, maxs, tw->sphere.radius,
+		tw->sphere.halfheight, &profile );
+
+	// the cylinder section only separates the caps when it has a height, and
+	// it can only be entered by horizontal movement
+	if ( tw->start[0] != tw->end[0] || tw->start[1] != tw->end[1] ) {
+		if ( profile.cylinderHalfheight > 0 ) {
+			// test for collisions between the cylinders
+			CM_TraceThroughVerticalCylinder( tw, profile.center,
+				profile.radius, profile.cylinderHalfheight,
+				tw->start, tw->end );
+		}
 	}
-
-	CM_TraceThroughSphere(
-		tw, profile.headOrigin, profile.headRadius, tw->start, tw->end );
-	if ( tw->trace.contents & CONTENTS_BODY ) {
-		headFraction = tw->trace.fraction;
-	}
-
-	tw->trace.contents = CM_RetailCapsuleHitContents(
-		tw->trace.contents, bodyFraction, headFraction );
+	// test for collision between the spheres
+	CM_TraceThroughSphere( tw, profile.topSphere, profile.radius,
+		startbottom, endbottom );
+	CM_TraceThroughSphere( tw, profile.bottomSphere, profile.radius,
+		starttop, endtop );
 }
 
 
@@ -1140,6 +1140,32 @@ static void CM_TraceThroughTree( traceWork_t *tw, int num, float p1f, float p2f,
 
 /*
 ==================
+CM_ValidateTraceResult
+
+Debug-only trace-plane invariant.  Kept in a helper so the plane source stays
+a used value in release builds, where the assert compiles away.
+==================
+*/
+static ID_INLINE void CM_ValidateTraceResult( const trace_t *trace, cm_tracePlaneSource_t source ) {
+#ifndef NDEBUG
+	const qboolean valid = CM_TraceResultHasValidPlaneContract( trace, source );
+
+	if ( !valid ) {
+		Com_Printf( "CM_Trace: invalid %s trace plane: fraction %f, "
+			"normal (%f %f %f), startsolid %i, allsolid %i\n",
+			source == CM_TRACE_PLANE_ANALYTIC ? "analytic" : "stored",
+			trace->fraction, trace->plane.normal[0], trace->plane.normal[1],
+			trace->plane.normal[2], trace->startsolid, trace->allsolid );
+	}
+	assert( valid );
+#endif
+	(void)trace;
+	(void)source;
+}
+
+
+/*
+==================
 CM_Trace
 ==================
 */
@@ -1149,6 +1175,7 @@ static void CM_Trace( trace_t *results, const vec3_t start, const vec3_t end, co
 	traceWork_t	tw;
 	vec3_t		offset;
 	cmodel_t	*cmod;
+	cm_tracePlaneSource_t	planeSource = CM_TRACE_PLANE_STORED;
 
 	cmod = CM_ClipHandleToModel( model );
 
@@ -1274,12 +1301,14 @@ static void CM_Trace( trace_t *results, const vec3_t start, const vec3_t end, co
 			else
 #elif defined(ALWAYS_CAPSULE_VS_CAPSULE)
 			if ( model == BOX_MODEL_HANDLE || model == CAPSULE_MODEL_HANDLE) {
+				planeSource = CM_TRACE_PLANE_ANALYTIC;
 				CM_TestCapsuleInCapsule( &tw, model );
 			}
 			else
 #endif
 			if ( model == CAPSULE_MODEL_HANDLE ) {
 				if ( tw.sphere.use ) {
+					planeSource = CM_TRACE_PLANE_ANALYTIC;
 					CM_TestCapsuleInCapsule( &tw, model );
 				}
 				else {
@@ -1318,12 +1347,14 @@ static void CM_Trace( trace_t *results, const vec3_t start, const vec3_t end, co
 			else
 #elif defined(ALWAYS_CAPSULE_VS_CAPSULE)
 			if ( model == BOX_MODEL_HANDLE || model == CAPSULE_MODEL_HANDLE) {
+				planeSource = CM_TRACE_PLANE_ANALYTIC;
 				CM_TraceCapsuleThroughCapsule( &tw, model );
 			}
 			else
 #endif
 			if ( model == CAPSULE_MODEL_HANDLE ) {
 				if ( tw.sphere.use ) {
+					planeSource = CM_TRACE_PLANE_ANALYTIC;
 					CM_TraceCapsuleThroughCapsule( &tw, model );
 				}
 				else {
@@ -1348,11 +1379,11 @@ static void CM_Trace( trace_t *results, const vec3_t start, const vec3_t end, co
 	}
 
 	/*
-	 * Retail capsule math permits a zero-fraction contact without a unit
-	 * plane.  Validate only the states in which the trace contract promises
-	 * one, while still catching corrupt fractions and fractional impacts.
+	 * The capsule sweep answers with an analytic radial plane, which is only
+	 * approximately unit and may be absent for a zero-fraction contact.  Hold
+	 * each producer to the invariant it actually promises.
 	 */
-	assert( CM_TraceResultHasValidPlaneContract( &tw.trace ) );
+	CM_ValidateTraceResult( &tw.trace, planeSource );
 	*results = tw.trace;
 }
 

@@ -56,23 +56,41 @@ Keep observed QLSRP or retail facts distinct from inferred design intent.
 The collision-model parity contract reserves handles 254 and 255 for the
 temporary capsule and box hulls, respectively. Both handles resolve to the
 shared temporary model that owns their bounds; the trace path uses the handle
-to choose the shape-specific math. The retail executable shows that an
-entity's `SVF_CAPSULE` hull is additionally gated on the incoming trace type:
-point/box traces test the entity box, while capsule traces may select the
-capsule. A reported retail-module server run exposed the previous FnQL mismatch
-as `14 < 254 < 256`: the map had 14 inline models, and FnQL rejected the
-reserved capsule handle as though it were an invalid inline-model index.
+to choose the shape-specific math. QLSRP records that retail QL additionally
+gates an entity's `SVF_CAPSULE` hull on the incoming trace type. Ordinary
+`G_TRACE` calls such as shotgun pellets therefore test the entity box, while
+`G_TRACECAPSULE` may select the capsule. A reported retail-module server run
+exposed the previous FnQL mismatch as `14 < 254 < 256`: the map had 14 inline
+models, and FnQL rejected the reserved capsule handle as though it were an
+invalid inline-model index.
 
-The retail moving capsule path is not the inherited Quake III two-ended
-capsule sweep. Observed retail behavior expands the target radius by the moving
-radius, traces the moving center through a full target-height cylinder, and
-then tests a head sphere at 70 percent of that expanded radius. When the head
-sphere is the nearer contact, retail adds `0x0400` (`CONTENTS_HEAD`) to
-`trace.contents`; the retail game module consumes that bit during weapon
-damage. Retail also permits zero-fraction analytic contacts with no plane, or
-with a sub-unit radial plane inside its one-unit collision epsilon. FnQL
-preserves those outputs and restricts its debug unit-plane invariant to true
-fractional impacts.
+Observed: QL keeps the Quake III moving-capsule sweep. QLSRP's `cm_trace.c`
+reduces the target capsule to a vertical cylinder capped by two spheres,
+expands the target radius by the moving capsule radius, sweeps the cylinder
+only when the sweep moves horizontally and the cylinder still has a positive
+height, and then sweeps each cap sphere against the opposite end of the moving
+capsule. QLSRP's shared `surfaceflags.h` leaves `0x0400` unallocated, so the
+engine adds no head-hit metadata to `trace.contents`. FnQL briefly shipped an
+invented body-cylinder plus 70-percent head-sphere profile with a
+`CONTENTS_HEAD` bit; a scripted sweep against a
+`(-15,-15,-24)..(15,15,32)` capsule showed it let a moving capsule pass
+straight through the target from below, at foot level, and above head level,
+so it was removed. `CM_BuildCapsuleTraceProfile` in
+[`cm_trace_contract.h`](../../code/qcommon/cm_trace_contract.h) now owns that
+geometry for both the engine and the parity tests.
+
+Observed: the capsule sweep answers with an analytic radial plane, scaling the
+impact vector by `1/(radius + RADIUS_EPSILON)` in single precision, and it
+permits a zero-fraction contact with no plane or a sub-unit plane from inside
+the one-unit collision epsilon. Measured over 400k random player-vs-player
+sweeps, the returned `|normal|^2` holds within `1e-4` of one at movement
+scale, spreads to `[0.79, 1.18]` for 16k-unit sweeps, and reaches
+`[0.22, 4.75]` at the 64k world limit, because the quadratic loses
+significance as the sweep start moves away from the target. Inferred: a debug
+build must not assert a unit plane on that path. `CM_ValidateTraceResult`
+therefore enforces the unit-plane invariant only for stored brush, patch and
+box planes, and holds analytic capsule planes to finite, non-degenerate values
+with an in-range fraction.
 
 The subsystem inventory, execution order, and non-regression gates for the
 native API, WebUI/Awesomium, protocol/demos, BSP/advertisements, ZMQ, and

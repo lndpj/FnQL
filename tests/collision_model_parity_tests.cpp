@@ -49,33 +49,39 @@ void TestRetailEntityShapeSelection()
 	CHECK( !UseCapsuleEntityModel( true, false ) );
 }
 
-void TestRetailCapsuleProfile()
+void TestCapsuleTraceProfile()
 {
+	// Retail QL player hull swept by an identically sized capsule.
 	const vec3_t mins = { -15.0f, -15.0f, -24.0f };
 	const vec3_t maxs = { 15.0f, 15.0f, 32.0f };
-	cm_retailCapsuleProfile_t profile{};
+	cm_capsuleProfile_t profile{};
 
-	static_assert( CONTENTS_HEAD == 0x0400 );
-	static_assert( CM_RETAIL_CAPSULE_HEAD_RADIUS_SCALE == 0.7f );
+	CM_BuildCapsuleTraceProfile( mins, maxs, 15.0f, 28.0f, &profile );
 
-	CM_BuildRetailCapsuleProfile( mins, maxs, 15.0f, &profile );
+	CHECK( profile.center[0] == 0.0f );
+	CHECK( profile.center[1] == 0.0f );
+	CHECK( profile.center[2] == 4.0f );
+	// The target radius carries the moving capsule's radius.
+	CHECK( profile.radius == 30.0f );
+	// A cap sphere sits one radius inside each end of the target capsule.
+	CHECK( profile.topSphere[2] == 17.0f );
+	CHECK( profile.bottomSphere[2] == -9.0f );
+	CHECK( profile.topSphere[0] == profile.center[0] );
+	CHECK( profile.bottomSphere[1] == profile.center[1] );
+	// Both capsule heights, minus what the cap spheres already cover.
+	CHECK( profile.cylinderHalfheight == 26.0f );
 
-	CHECK( profile.bodyOrigin[0] == 0.0f );
-	CHECK( profile.bodyOrigin[1] == 0.0f );
-	CHECK( profile.bodyOrigin[2] == 4.0f );
-	CHECK( profile.bodyRadius == 30.0f );
-	CHECK( profile.bodyHalfheight == 28.0f );
-	CHECK( profile.headOrigin[0] == 0.0f );
-	CHECK( profile.headOrigin[1] == 0.0f );
-	CHECK( profile.headOrigin[2] == 32.0f );
-	CHECK( std::fabs( profile.headRadius - 21.0f ) < 0.0001f );
+	// A wide enough sweeping capsule leaves no cylinder section at all, and
+	// the trace path must skip the cylinder rather than sweep a negative one.
+	const vec3_t cubeMins = { -16.0f, -16.0f, -16.0f };
+	const vec3_t cubeMaxs = { 16.0f, 16.0f, 16.0f };
 
-	CHECK( CM_RetailCapsuleHitContents(
-		CONTENTS_BODY, 0.5f, 0.25f ) == ( CONTENTS_BODY | CONTENTS_HEAD ) );
-	CHECK( CM_RetailCapsuleHitContents(
-		CONTENTS_BODY, 0.25f, 0.5f ) == CONTENTS_BODY );
-	CHECK( CM_RetailCapsuleHitContents(
-		CONTENTS_BODY, 0.5f, 0.5f ) == CONTENTS_BODY );
+	CM_BuildCapsuleTraceProfile( cubeMins, cubeMaxs, 24.0f, 24.0f, &profile );
+
+	CHECK( profile.radius == 40.0f );
+	CHECK( profile.topSphere[2] == profile.center[2] );
+	CHECK( profile.bottomSphere[2] == profile.center[2] );
+	CHECK( !( profile.cylinderHalfheight > 0.0f ) );
 }
 
 void TestTracePlaneContract()
@@ -83,30 +89,58 @@ void TestTracePlaneContract()
 	trace_t trace{};
 
 	trace.fraction = 1.0f;
-	CHECK( CM_TraceResultHasValidPlaneContract( &trace ) );
+	CHECK( CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_STORED ) );
+	CHECK( CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
 
-	// Retail can return no plane for an overlap at the starting point.
+	// A capsule overlap at the starting point returns no plane at all.
 	trace.fraction = 0.0f;
 	trace.startsolid = qtrue;
-	CHECK( CM_TraceResultHasValidPlaneContract( &trace ) );
+	CHECK( CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
 
-	// Its one-unit analytic epsilon can also produce a sub-unit start plane.
+	// The one-unit analytic epsilon can also produce a sub-unit start plane.
 	trace.startsolid = qfalse;
 	trace.plane.normal[0] = 0.95f;
-	CHECK( CM_TraceResultHasValidPlaneContract( &trace ) );
+	CHECK( CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
+
+	// A fractional impact must carry a plane on every path.
+	trace.fraction = 0.5f;
+	VectorClear( trace.plane.normal );
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_STORED ) );
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
+
+	VectorSet( trace.plane.normal, 1.0f, 0.0f, 0.0f );
+	CHECK( CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_STORED ) );
+	CHECK( CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
+
+	// Stored BSP planes are unit; the analytic capsule plane drifts off unit
+	// length with distance, so only the stored path may demand one.
+	trace.plane.normal[0] = 1.1f;
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_STORED ) );
+	CHECK( CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
+	trace.plane.normal[0] = 0.89f;
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_STORED ) );
+	CHECK( CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
+
+	// Corrupt fractions and non-finite normals stay defects on both paths.
+	VectorSet( trace.plane.normal, 1.0f, 0.0f, 0.0f );
+	trace.fraction = NAN;
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_STORED ) );
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
+	trace.fraction = 1.01f;
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_STORED ) );
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
+	trace.fraction = -0.01f;
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
 
 	trace.fraction = 0.5f;
-	CHECK( !CM_TraceResultHasValidPlaneContract( &trace ) );
-	VectorSet( trace.plane.normal, 1.0f, 0.0f, 0.0f );
-	CHECK( CM_TraceResultHasValidPlaneContract( &trace ) );
+	trace.plane.normal[1] = NAN;
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_STORED ) );
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
+	trace.plane.normal[1] = HUGE_VALF;
+	CHECK( !CM_TraceResultHasValidPlaneContract( &trace, CM_TRACE_PLANE_ANALYTIC ) );
 
-	trace.plane.normal[0] = 1.1f;
-	CHECK( !CM_TraceResultHasValidPlaneContract( &trace ) );
-	trace.fraction = NAN;
-	CHECK( !CM_TraceResultHasValidPlaneContract( &trace ) );
-	trace.fraction = 1.01f;
-	CHECK( !CM_TraceResultHasValidPlaneContract( &trace ) );
-	CHECK( !CM_TraceResultHasValidPlaneContract( nullptr ) );
+	CHECK( !CM_TraceResultHasValidPlaneContract( nullptr, CM_TRACE_PLANE_STORED ) );
+	CHECK( !CM_TraceResultHasValidPlaneContract( nullptr, CM_TRACE_PLANE_ANALYTIC ) );
 }
 
 } // namespace
@@ -115,7 +149,7 @@ int main()
 {
 	TestReservedHandleContract();
 	TestRetailEntityShapeSelection();
-	TestRetailCapsuleProfile();
+	TestCapsuleTraceProfile();
 	TestTracePlaneContract();
 	return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
