@@ -106,14 +106,14 @@ class RtxRendererContractSourceTests(unittest.TestCase):
 
         self.assertNotIn("x86_64", focused_ci)
 
-    def test_rtx_exports_the_complete_quake_live_renderer_api_13_surface(self) -> None:
+    def test_rtx_exports_the_complete_current_renderer_abi_surface(self) -> None:
         public = read("code/renderercommon/tr_public.h")
         init = read("code/rendererrtx/tr_init.c")
         vulkan_init = read("code/renderervk/tr_init.c")
         common_font = read("code/renderercommon/tr_font.c")
         stash = read("code/renderercommon/tr_font_stash.c")
 
-        self.assertIn("#define\tREF_API_VERSION\t\t13", public)
+        self.assertIn("#define\tREF_API_VERSION\t\t14", public)
         self.assertIn("Com_Memset( &re, 0, sizeof( re ) );", init)
         exports = (
             "re.AdvertisementBridge_UpdateLoadingViewParameters = AdvertisementBridge_UpdateLoadingViewParameters;",
@@ -123,6 +123,7 @@ class RtxRendererContractSourceTests(unittest.TestCase):
             "re.MeasureScaledText = RE_MeasureScaledText;",
             "re.GetScaledFontMetrics = RE_GetScaledFontMetrics;",
             "re.GetFontAtlasDebugShader = RE_GetFontAtlasDebugShader;",
+            "re.SetUnderwaterView = RE_SetUnderwaterView;",
         )
         for export in exports:
             self.assertIn(export, init)
@@ -131,7 +132,7 @@ class RtxRendererContractSourceTests(unittest.TestCase):
         self.assertEqual(
             set(assignment_pattern.findall(init)),
             set(assignment_pattern.findall(vulkan_init)),
-            "RTX must export the complete current FnQL renderer ABI, not only the new API-13 entries",
+            "RTX must export the complete current FnQL renderer ABI, not only the newest entries",
         )
 
         self.assertIn("R_InitHostFonts();", common_font)

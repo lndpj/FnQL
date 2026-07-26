@@ -153,6 +153,96 @@ class SteamProviderSourceTests(unittest.TestCase):
         self.assertIn("result == FNQL_STEAM_RESULT_UNAVAILABLE", source)
         self.assertIn('? "unavailable" : "startup-failed"', source)
 
+    def test_startup_checks_the_steam_account_beside_the_library_checks(self) -> None:
+        loader = (ROOT / "code/platform/fnql_steam.cpp").read_text(encoding="utf-8")
+
+        # The account is a separate condition from the provider and steam_api
+        # libraries, and is read only from the provider status.
+        self.assertIn("bool SteamAccountSignedIn()", loader)
+        self.assertIn("FNQL_Steam_GetStatus(&status)", loader)
+        self.assertIn(
+            "status.client_logged_on != 0 && status.local_steam_id != 0", loader
+        )
+
+        # Both signed-out shapes reach one notification: an unavailable startup
+        # result, and a provider that starts without an active user.
+        self.assertIn("result == FNQL_STEAM_RESULT_UNAVAILABLE", loader)
+        self.assertIn("? SteamSession::SignedOut : SteamSession::Resolved;", loader)
+        started = loader.index("state.initialized = true;")
+        account_check = loader.index("SteamAccountSignedIn()", started)
+        self.assertLess(started, account_check)
+        self.assertLess(account_check, loader.index("return SteamSession::SignedOut;", started))
+
+        # A library failure a sign-in cannot fix keeps the existing fallback.
+        for resolved in (
+            "com_steamProvider must be an absolute path or a bare library name.",
+            "Steam provider library was not found or could not be loaded: %s",
+            "Steam API path is unavailable or com_steamApi is not absolute.",
+            "Steam provider ABI is incompatible or incomplete.",
+            "Steam provider exposed no usable capabilities.",
+        ):
+            branch = loader.index(resolved)
+            self.assertIn(
+                "return SteamSession::Resolved;",
+                loader[branch : loader.index("\n\t}", branch)],
+            )
+
+    def test_missing_steam_login_offers_proceed_retry_or_quit(self) -> None:
+        loader = (ROOT / "code/platform/fnql_steam.cpp").read_text(encoding="utf-8")
+        header = (ROOT / "code/qcommon/qcommon.h").read_text(encoding="utf-8")
+        windows = (ROOT / "code/win32/win_main.cpp").read_text(encoding="utf-8")
+        unix = (ROOT / "code/unix/unix_main.cpp").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "sysStartupChoice_t Sys_PromptStartupChoice( const char *title,"
+            " const char *message );",
+            header,
+        )
+        for source in (header, windows, unix):
+            for choice in (
+                "SYS_STARTUP_PROCEED",
+                "SYS_STARTUP_RETRY",
+                "SYS_STARTUP_QUIT",
+            ):
+                self.assertIn(choice, source)
+
+        # Win32 uses the standard three-answer modal; a dialog that cannot be
+        # built or shown falls through to proceed.
+        self.assertIn("MB_CANCELTRYCONTINUE", windows)
+        self.assertIn("case IDTRYAGAIN:", windows)
+        self.assertIn("case IDCANCEL:", windows)
+        self.assertEqual(windows.count("return SYS_STARTUP_PROCEED;"), 4)
+
+        # Unix never waits for an answer that cannot arrive.
+        self.assertIn(
+            "if ( ttycon_on || isatty( STDIN_FILENO ) != 1"
+            " || isatty( STDOUT_FILENO ) != 1 )",
+            unix,
+        )
+
+        # Retry repeats the whole load-and-start sequence, quit exits through the
+        # ordinary shutdown path, and proceed keeps the non-Steam fallback.
+        self.assertIn("void ReleaseProviderForRetry()", loader)
+        self.assertIn("bool ResolveMissingSteamLogin(bool offerChoice)", loader)
+        self.assertIn("choice == SYS_STARTUP_RETRY", loader)
+        self.assertIn("choice == SYS_STARTUP_QUIT", loader)
+        self.assertIn("Com_Quit_f();", loader)
+        self.assertIn("Continuing without a signed-in Steam account.", loader)
+        self.assertIn(
+            "while (StartSteamProvider(roles, enabled, providerName->string,", loader
+        )
+        self.assertIn("if (!ResolveMissingSteamLogin(offerLoginChoice))", loader)
+
+        # The notification is startup-only, client-only, and never blocks
+        # deterministic build-script runs.
+        self.assertIn('Cvar_Get("com_steamLoginPrompt", "1"', loader)
+        offer = loader.index("const bool offerLoginChoice")
+        gate = loader[offer : loader.index(";", offer)]
+        self.assertIn("(roles & FNQL_STEAM_ROLE_CLIENT) != 0", gate)
+        self.assertIn("loginPrompt->integer != 0", gate)
+        self.assertIn("!state.loginPromptOffered", gate)
+        self.assertIn('!Cvar_VariableIntegerValue("com_buildScript")', gate)
+
     def test_opt_in_failures_announce_non_steam_fallback_once(self) -> None:
         source = (ROOT / "code/platform/fnql_steam.cpp").read_text(encoding="utf-8")
         self.assertIn("void EnterNonSteamFallback", source)

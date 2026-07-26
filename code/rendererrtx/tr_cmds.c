@@ -789,6 +789,7 @@ void RE_BeginFrame( stereoFrame_t stereoFrame ) {
 #ifdef USE_VULKAN
 	backEnd.doneBloom = qfalse;
 	backEnd.doneMotionBlur = qfalse;
+	backEnd.doneUnderwater = qfalse;
 #endif
 	backEnd.bloomProtectHighlights = qfalse;
 

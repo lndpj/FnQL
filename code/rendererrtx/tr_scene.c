@@ -111,6 +111,64 @@ void RE_AddLiquidInteractionToScene( const liquidInteraction_t *interaction )
 	r_liquidInteractions[r_numLiquidInteractions++] = *interaction;
 }
 
+/*
+Visual-only submerged-view sample.  The engine pushes at most one record per
+world scene immediately before RE_RenderScene, and the entry/exit ramp is aged
+here rather than in the engine: only the renderer knows which submitted views
+are real world views, and driving the ramp from scene time alone keeps a stereo
+pair, a repeated submission, and a demo seek from advancing it twice.
+*/
+static underwaterView_t r_underwaterSample;
+static underwaterViewState_t r_underwaterState;
+
+
+void RE_SetUnderwaterView( const underwaterView_t *view )
+{
+	if ( !view ) {
+		return;
+	}
+	r_underwaterSample.contents = view->contents & UNDERWATER_CONTENTS_MASK;
+	r_underwaterSample.time = view->time;
+}
+
+
+static void R_CopyUnderwaterViewToRefdef( int sceneTime )
+{
+	int contents = 0;
+	int64_t age;
+	float strength;
+
+	tr.refdef.underwaterContents = 0;
+	tr.refdef.underwaterStrength = 0.0f;
+	if ( !r_underwater || !r_underwater->integer ) {
+		R_UnderwaterResetView( &r_underwaterState );
+		return;
+	}
+	/* Cgame commonly submits an RDF_NOWORLDMODEL scene for 3D HUD models after
+	 * the world view.  Such a scene gets no medium, but it must not touch the
+	 * ramp either: resetting here would invalidate the state every frame and
+	 * every world scene would then snap to full strength instead of ramping. */
+	if ( tr.refdef.rdflags & RDF_NOWORLDMODEL ) {
+		return;
+	}
+
+	/* Only a sample taken for this scene may drive the medium.  A record left
+	 * over from a previous map, a disconnected session, or a stretch of frames
+	 * the engine did not sample has to read as dry rather than as the last
+	 * liquid the camera happened to be inside. */
+	age = (int64_t)sceneTime - (int64_t)r_underwaterSample.time;
+	if ( age >= 0 && age <= UNDERWATER_TRANSITION_RESET_MSEC ) {
+		contents = r_underwaterSample.contents;
+	}
+
+	strength = R_UnderwaterAdvanceView( &r_underwaterState, contents, sceneTime );
+	if ( strength > 0.0f ) {
+		tr.refdef.underwaterContents = r_underwaterState.contents;
+		tr.refdef.underwaterStrength = strength;
+	}
+}
+
+
 static void R_CopyLiquidInteractionsToRefdef( int sceneTime )
 {
 	int first;
@@ -1306,6 +1364,7 @@ void RE_RenderScene( const refdef_t *fd ) {
 	tr.refdef.num_dlights = r_numdlights - r_firstSceneDlight;
 	tr.refdef.dlights = &backEndData->dlights[r_firstSceneDlight];
 	R_CopyLiquidInteractionsToRefdef( tr.refdef.time );
+	R_CopyUnderwaterViewToRefdef( tr.refdef.time );
 
 	tr.refdef.numPolys = r_numpolys - r_firstScenePoly;
 	tr.refdef.polys = &backEndData->polys[r_firstScenePoly];

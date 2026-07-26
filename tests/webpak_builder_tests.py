@@ -55,7 +55,7 @@ def decode_datapack(path: Path) -> dict[str, bytes]:
 
 
 class WebPakBuilderTests(unittest.TestCase):
-    def test_settings_tab_follows_retail_navigation_contract(self) -> None:
+    def test_settings_overlay_extends_retail_sections_without_a_tab(self) -> None:
         script = (
             ROOT / "code" / "client" / "webui" / "fnql-settings.js"
         ).read_text(encoding="utf-8")
@@ -63,20 +63,38 @@ class WebPakBuilderTests(unittest.TestCase):
             ROOT / "code" / "client" / "webui" / "css" / "fnql-settings.css"
         ).read_text(encoding="utf-8")
 
-        self.assertIn("nav.appendChild(tab);", script)
-        self.assertIn("else if (tab.nextSibling)", script)
-        self.assertNotIn("nav.insertBefore(tab", script)
-        self.assertIn("clearRetailActiveTabs(nav);", script)
-        self.assertIn("tab.className = 'button fnql-settings-tab active';", script)
-        self.assertIn("retailTab.classList.add('active');", script)
-        self.assertIn("deactivate(node);", script)
-        self.assertIn("if (currentRoot && currentRoot !== root)", script)
-        self.assertIn(
-            "window.addEventListener('hashchange', function () {\n      deactivate();",
-            script,
-        )
-        self.assertNotIn("is-active", script)
-        self.assertNotIn(".fnql-settings-tab", style)
+        # The transitional standalone tab is gone; every control now lives in the
+        # retail section it belongs to.
+        self.assertNotIn("fnql-settings-tab", script)
+        self.assertNotIn("fnql-settings-panel", script)
+        self.assertNotIn("nav.button-row", script)
+        self.assertNotIn("fnql-settings-tab", style)
+        self.assertNotIn("fnql-settings-panel", style)
+
+        # Injected nodes are only ever appended. React reconciles its own
+        # children by index, so a node inserted ahead of them would make its
+        # inserts and moves land in the wrong place.
+        self.assertIn("section.appendChild(group);", script)
+        self.assertIn("section.appendChild(actions);", script)
+        self.assertIn("container.appendChild(makeRow(settings[index], value));", script)
+        self.assertNotIn("insertBefore", script)
+
+        # Route and cvar-availability changes rebuild instead of patching, so a
+        # section never keeps rows belonging to another route or backend.
+        self.assertIn("route !== currentRoute || signature !== currentSignature", script)
+        self.assertIn("removeInjected(root);", script)
+        self.assertIn("function routeSignature(route, cache)", script)
+        self.assertIn("window.addEventListener('hashchange'", script)
+        self.assertIn("window.setInterval(attach, 500)", script)
+
+        # Rows reuse the retail cvar markup and the retail react-select markup,
+        # because Awesomium's offscreen view does not composite native popups.
+        self.assertIn("'row cvar ' + setting.type + ' fnql-cvar'", script)
+        self.assertIn("'children seven columns'", script)
+        self.assertIn("'val five columns'", script)
+        self.assertIn("'Select-control'", script)
+        self.assertIn("'Select-menu-outer'", script)
+        self.assertNotIn("createElement('select')", script)
 
     def test_project_overlay_is_sparse_and_round_trips(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -94,21 +112,14 @@ class WebPakBuilderTests(unittest.TestCase):
             {"index.html", "fnql-settings.js", "css/fnql-settings.css"},
         )
         self.assertIn(b'<script src="bundle.js"></script>', decoded["index.html"])
-        self.assertIn(b"patchLegacyVideoSettings", decoded["fnql-settings.js"])
-        self.assertIn(b"settingsSignature", decoded["fnql-settings.js"])
-        self.assertIn(
-            b"panel.__fnqlSettingsSignature !== settingsSignature(cvarCache())",
-            decoded["fnql-settings.js"],
-        )
+        self.assertIn(b"RETAIL_UNSUPPORTED", decoded["fnql-settings.js"])
+        self.assertIn(b"routeSignature", decoded["fnql-settings.js"])
         self.assertIn(b"window.addEventListener('hashchange'", decoded["fnql-settings.js"])
-        self.assertIn(b"window.setInterval(attach, 1000)", decoded["fnql-settings.js"])
-        self.assertIn(b"nav.appendChild(tab);", decoded["fnql-settings.js"])
-        self.assertIn(
-            b"tab.className = 'button fnql-settings-tab active';",
-            decoded["fnql-settings.js"],
-        )
-        self.assertNotIn(b"is-active", decoded["fnql-settings.js"])
-        self.assertNotIn(b".fnql-settings-tab", decoded["css/fnql-settings.css"])
+        self.assertIn(b"window.setInterval(attach, 500)", decoded["fnql-settings.js"])
+        self.assertIn(b"section.appendChild(group);", decoded["fnql-settings.js"])
+        self.assertNotIn(b"fnql-settings-tab", decoded["fnql-settings.js"])
+        self.assertNotIn(b"fnql-settings-panel", decoded["fnql-settings.js"])
+        self.assertNotIn(b"fnql-settings-tab", decoded["css/fnql-settings.css"])
         source_paths = {
             resource.virtual_path
             for resource in build_webpak.collect_resources(

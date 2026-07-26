@@ -59,6 +59,27 @@ class WebUiBackendSourceTests(unittest.TestCase):
         self.assertIn("webPakPath_.clear();", adapter)
         self.assertNotIn("#include <Awesomium/", adapter)
 
+        # Awesomium builds the event from a Win32 message triple; forwarding the
+        # neutral event type as the message id leaves the event untyped and its
+        # text empty, which is what stops retail input fields from receiving
+        # characters.
+        self.assertIn("_Awe_new_WebKeyboardEvent_1@12", adapter)
+        keyboard = adapter[
+            adapter.index("BackendResult InjectKeyboard") :
+            adapter.index("BackendResult StopLoading")
+        ]
+        self.assertIn("message = WM_KEYDOWN;", keyboard)
+        self.assertIn("message = WM_KEYUP;", keyboard)
+        self.assertIn("message = WM_CHAR;", keyboard)
+        self.assertIn(
+            "newWebKeyboardEvent( message, event.virtualKey,\n\t\t\tMessageKeyParameter( event ) )",
+            keyboard,
+        )
+        self.assertNotIn("static_cast<unsigned int>( event.type )", keyboard)
+        self.assertIn("static long MessageKeyParameter", adapter)
+        self.assertIn("MapVirtualKeyW( event.virtualKey, MAPVK_VK_TO_VSC )", adapter)
+        self.assertIn("static bool IsExtendedVirtualKey", adapter)
+
         shutdown = adapter[
             adapter.index("void ShutdownRuntimeObjects() noexcept") :
             adapter.index("struct PendingResource")

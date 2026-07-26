@@ -1408,6 +1408,18 @@ void	Sys_DisplaySystemConsole( qboolean show );
 void	Sys_ShowConsole( int level, qboolean quitOnClose );
 void	Sys_SetErrorText( const char *text );
 
+// Startup conditions that are recoverable but need a human decision before the
+// engine commits to them.  Sessions without an interactive surface (redirected
+// stdio, unattended dedicated hosts, build scripts) always report
+// SYS_STARTUP_PROCEED so automation never blocks on a notification.
+typedef enum {
+	SYS_STARTUP_PROCEED,
+	SYS_STARTUP_RETRY,
+	SYS_STARTUP_QUIT
+} sysStartupChoice_t;
+
+sysStartupChoice_t Sys_PromptStartupChoice( const char *title, const char *message );
+
 void	Sys_SendPacket( int length, const void *data, const netadr_t *to );
 
 qboolean	Sys_StringToAdr( const char *s, netadr_t *a, netadrtype_t family );

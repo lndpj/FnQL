@@ -388,6 +388,11 @@ IF(FNQL_AUDIO_LOOPBACK_TESTS)
 	target_include_directories(fnql_audio_occlusion_tests PRIVATE code/client/audio/shared)
 	add_test(NAME fnql_audio_occlusion COMMAND fnql_audio_occlusion_tests)
 
+	ADD_EXECUTABLE(fnql_audio_tone_tests tests/audio/tone_policy_tests.cpp)
+	target_compile_features(fnql_audio_tone_tests PRIVATE cxx_std_17)
+	target_include_directories(fnql_audio_tone_tests PRIVATE code/client/audio/shared)
+	add_test(NAME fnql_audio_tone COMMAND fnql_audio_tone_tests)
+
 	ADD_EXECUTABLE(fnql_audio_voice_queue_tests tests/audio/voice_queue_tests.cpp)
 	target_compile_features(fnql_audio_voice_queue_tests PRIVATE cxx_std_17)
 	target_include_directories(fnql_audio_voice_queue_tests PRIVATE code/client/audio/shared)

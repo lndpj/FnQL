@@ -3758,14 +3758,26 @@ static const void *RB_DrawSurfs( const void *data ) {
 
 #ifdef USE_VULKAN
 	/* Preserve the completed world depth and apply the optional sidecar before
-	 * motion blur, bloom/gamma, and later HUD/console scenes. */
-	if ( !( cmd->refdef.rdflags & RDF_NOWORLDMODEL ) && r_globalFog &&
-		r_globalFog->integer && tr.world && tr.world->globalFog.loaded &&
-		!vk_depth_fade_ready() ) {
+	 * motion blur, bloom/gamma, and later HUD/console scenes.  The submerged
+	 * view needs the same copy for its distance absorption, so request it here
+	 * as well rather than leaving that layer silently untinted whenever the
+	 * global-fog sidecar happens to be absent. */
+	if ( !( cmd->refdef.rdflags & RDF_NOWORLDMODEL ) && !vk_depth_fade_ready() &&
+		( ( r_globalFog && r_globalFog->integer && tr.world &&
+			tr.world->globalFog.loaded ) ||
+		  ( r_underwater && r_underwater->integer &&
+			cmd->refdef.underwaterStrength > 0.0f ) ) ) {
 		vk_copy_depth_fade();
 	}
 	if ( !( cmd->refdef.rdflags & RDF_NOWORLDMODEL ) ) {
 		vk_draw_global_fog();
+	}
+
+	/* The submerged view is a property of the eye's medium, so it composites
+	 * over the finished scene and its fog, and still ahead of motion blur,
+	 * bloom, gamma, and later HUD/console scenes. */
+	if ( !( cmd->refdef.rdflags & RDF_NOWORLDMODEL ) ) {
+		vk_draw_underwater();
 	}
 
 	if ( cmd->refdef.switchRenderPass ) {

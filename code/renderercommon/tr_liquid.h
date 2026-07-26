@@ -25,6 +25,15 @@ exactly the same way.
 #define LIQUID_WARP_SCALE_MAX 2.0f
 #define LIQUID_RIPPLE_PIXEL_SCALE 10.0f
 
+/* Expanding ring shape. The ring travels outward at LIQUID_RIPPLE_EXPAND_SPEED
+ * units per second and its band widens with the *current* radius, so an old
+ * ring is broad and soft instead of a thin hard circle. The GLx GLSL, Vulkan
+ * GLSL, ARB assembly, and per-vertex fallback all evaluate the same shape;
+ * tests/liquid_rendering_source_tests.py enforces the parity. */
+#define LIQUID_RIPPLE_EXPAND_SPEED 150.0f
+#define LIQUID_RIPPLE_WIDTH_BASE 20.0f
+#define LIQUID_RIPPLE_WIDTH_SCALE 0.12f
+
 /* Screen-space displacement fades with eye distance (clip-space W is the
  * view-space depth in idTech3 units) so distant liquid does not shimmer, and
  * with the grazing angle so the compressed wave field near the horizon does
@@ -47,7 +56,54 @@ exactly the same way.
 #define LIQUID_REFLECT_INTENSITY 0.85f
 #define LIQUID_FRESNEL_ALPHA_BASE 0.04f
 #define LIQUID_FRESNEL_ALPHA_SPAN 0.56f
+#define LIQUID_FRESNEL_ALPHA_MAX 0.60f
 #define LIQUID_NORMAL_PERTURB 0.12f
+
+/* Schlick's approximation raises (1 - cos) to the fifth power. A squared
+ * falloff spreads reflection across every viewing angle, which is what makes
+ * screen-space water read as a uniform milky sheen; the fifth power keeps the
+ * surface nearly clear when looked straight down and lets the reflection climb
+ * sharply toward grazing, which is how water actually behaves. Every backend
+ * evaluates the same curve. */
+#define LIQUID_FRESNEL_POWER 5
+
+static ID_INLINE float R_LiquidFresnel( float cosTheta )
+{
+	const float f = Com_Clamp( 0.0f, 1.0f, 1.0f - fabsf( cosTheta ) );
+	const float f2 = f * f;
+
+	return f2 * f2 * f;	/* fifth power */
+}
+
+/* Wave-perturbed shading normal. The gradient is a displacement inside the
+ * surface's own tangent plane, so it must be applied through a tangent frame
+ * rather than added to model-space XY: on a vertical or slanted liquid face
+ * the XY form pushes part of the gradient straight along the normal, where it
+ * only rescales the vector instead of tilting it. The reference axis is chosen
+ * so a horizontal face reduces to exactly ( gradientX, gradientY, 0 ), which
+ * keeps the appearance of ordinary water brushes unchanged. */
+#define LIQUID_TANGENT_AXIS_EPSILON 0.9f
+
+static ID_INLINE void R_LiquidTangentFrame( const vec3_t normal, vec3_t tangent,
+	vec3_t bitangent )
+{
+	vec3_t reference;
+	float length;
+
+	if ( fabsf( normal[2] ) < LIQUID_TANGENT_AXIS_EPSILON ) {
+		VectorSet( reference, 0.0f, 0.0f, 1.0f );
+	} else {
+		VectorSet( reference, 0.0f, 1.0f, 0.0f );
+	}
+	CrossProduct( reference, normal, tangent );
+	length = VectorLength( tangent );
+	if ( length > 1e-6f ) {
+		VectorScale( tangent, 1.0f / length, tangent );
+	} else {
+		VectorSet( tangent, 1.0f, 0.0f, 0.0f );
+	}
+	CrossProduct( normal, tangent, bitangent );
+}
 
 /*
 Ambient wave gradient model, evaluated per fragment on programmable paths and

@@ -25,7 +25,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "tr_types.h"
 #include "vulkan/vulkan.h"
 
-#define	REF_API_VERSION		13
+#define	REF_API_VERSION		14
 
 //
 // these are the functions exported by the refresh module
@@ -77,6 +77,7 @@ typedef struct {
 	void	(*AddAdditiveLightToScene)( const vec3_t org, float intensity, float r, float g, float b );
 	void	(*AddLinearLightToScene)( const vec3_t start, const vec3_t end, float intensity, float r, float g, float b );
 	void	(*AddLiquidInteractionToScene)( const liquidInteraction_t *interaction );
+	void	(*SetUnderwaterView)( const underwaterView_t *view );
 	void	(*RenderScene)( const refdef_t *fd );
 	void	(*AdvertisementBridge_UpdateLoadingViewParameters)( void );
 

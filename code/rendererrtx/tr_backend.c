@@ -4069,6 +4069,11 @@ static const void *RB_DrawSurfs( const void *data ) {
 #ifdef USE_VULKAN
 	vk_draw_global_fog();
 
+	/* The submerged view is a property of the eye's medium, so it composites
+	 * over the finished scene and its fog, and still ahead of motion blur,
+	 * bloom, gamma, and later HUD/console scenes. */
+	vk_draw_underwater();
+
 	if ( cmd->refdef.switchRenderPass ) {
 		vk_end_render_pass();
 		vk_begin_main_render_pass();
@@ -4468,6 +4473,7 @@ static const void *RB_SwapBuffers( const void *data ) {
 #ifdef USE_VULKAN
 	backEnd.doneBloom = qfalse;
 	backEnd.doneMotionBlur = qfalse;
+	backEnd.doneUnderwater = qfalse;
 #endif
 	RB_FrameGraph_EndLifecycle( qtrue );
 

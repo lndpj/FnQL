@@ -69,6 +69,14 @@ The directives are:
 - `sky <0|1|true|false|yes|no>`: optional; defaults to true. When false,
   clear-depth sky pixels are excluded.
 
+`color` is display-referred: an authored value reaches the screen as that
+value once fog fully saturates. The compositor blends into the scene color
+buffer, which the final output transform still multiplies by the overbright
+scale (`1 << r_overBrightBits`, and the tone-map exposure in the scene-linear
+HDR mode), so each renderer removes that scale from the authored color before
+blending. Without it an authored mid-grey arrives at twice its brightness and
+the layer reads as a uniform wash rather than distance fog.
+
 For distance `d` after subtracting `start`, exponential mode uses
 `1 - exp(-density * d)`, squared-exponential mode uses
 `1 - exp(-(density * d)^2)`, and linear mode uses

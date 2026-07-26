@@ -33,10 +33,6 @@ DEFAULT_WEAPON_SOUND_SHADER_ASSETS = [
         PKG_ROOT / "baseq3" / "sound" / "fnql-weapon-sounds.sndshd",
         Path("baseq3") / "sound" / "fnql-weapon-sounds.sndshd",
     ),
-    (
-        PKG_ROOT / "missionpack" / "sound" / "fnql-weapon-sounds.sndshd",
-        Path("missionpack") / "sound" / "fnql-weapon-sounds.sndshd",
-    ),
 ]
 
 DEFAULT_RENDERER_SHADER_ASSETS = [

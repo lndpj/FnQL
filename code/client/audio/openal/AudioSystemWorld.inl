@@ -664,110 +664,27 @@ public:
 	}
 };
 
-enum class SoundToneClass {
-	Neutral,
-	World,
-	Weapon,
-	Voice,
-	Item,
-	Body,
-	Local,
-	Announcer,
-	Stereo,
-	Multichannel,
-	Underwater
-};
-
 struct VoiceToneSettings {
-	SoundToneClass soundClass = SoundToneClass::Neutral;
+	tone::SoundToneClass soundClass = tone::SoundToneClass::Neutral;
 	AudioFilterSettings directTone;
 	AudioFilterSettings sendTone;
 };
 
-static const char *SoundToneClassName( SoundToneClass soundClass ) {
-	switch ( soundClass ) {
-	case SoundToneClass::World:
-		return "world";
-	case SoundToneClass::Weapon:
-		return "weapon";
-	case SoundToneClass::Voice:
-		return "voice";
-	case SoundToneClass::Item:
-		return "item";
-	case SoundToneClass::Body:
-		return "body";
-	case SoundToneClass::Local:
-		return "local";
-	case SoundToneClass::Announcer:
-		return "announcer";
-	case SoundToneClass::Stereo:
-		return "stereo";
-	case SoundToneClass::Multichannel:
-		return "multichannel";
-	case SoundToneClass::Underwater:
-		return "underwater";
-	default:
-		return "neutral";
-	}
-}
-
-static bool SampleNameStartsWith( const SoundSample *sample, const char *prefix ) {
-	if ( sample == nullptr || prefix == nullptr ) {
-		return false;
-	}
-
-	const std::string &name = sample->Name();
-	const size_t prefixLength = std::strlen( prefix );
-	return name.size() >= prefixLength && std::strncmp( name.c_str(), prefix, prefixLength ) == 0;
-}
-
-static SoundToneClass ClassifyVoiceTone( const SoundVoice &voice, const EnvironmentState &environment, bool listenerAttached, bool localOnly, bool stereoSample, bool monoWorldSource ) {
-	if ( stereoSample ) {
-		if ( voice.sample != nullptr && voice.sample->Channels() > kDefaultStreamChannels ) {
-			return SoundToneClass::Multichannel;
-		}
-		return SoundToneClass::Stereo;
-	}
-	if ( voice.entchannel == CHAN_ANNOUNCER ) {
-		return SoundToneClass::Announcer;
-	}
-
-	switch ( voice.entchannel ) {
+static tone::SoundToneClass ToneClassForChannel( int entchannel ) {
+	switch ( entchannel ) {
+	case CHAN_ANNOUNCER:
+		return tone::SoundToneClass::Announcer;
 	case CHAN_WEAPON:
-		return SoundToneClass::Weapon;
+		return tone::SoundToneClass::Weapon;
 	case CHAN_VOICE:
-		return SoundToneClass::Voice;
+		return tone::SoundToneClass::Voice;
 	case CHAN_ITEM:
-		return SoundToneClass::Item;
+		return tone::SoundToneClass::Item;
 	case CHAN_BODY:
-		return SoundToneClass::Body;
+		return tone::SoundToneClass::Body;
 	default:
-		break;
+		return tone::SoundToneClass::Neutral;
 	}
-
-	if ( localOnly || listenerAttached ) {
-		return SoundToneClass::Local;
-	}
-	if ( SampleNameStartsWith( voice.sample, "sound/weapons/" ) ) {
-		return SoundToneClass::Weapon;
-	}
-	if ( SampleNameStartsWith( voice.sample, "sound/items/" ) ) {
-		return SoundToneClass::Item;
-	}
-	if ( SampleNameStartsWith( voice.sample, "sound/player/" ) ) {
-		return SoundToneClass::Body;
-	}
-	if ( SampleNameStartsWith( voice.sample, "sound/feedback/" ) ) {
-		return SoundToneClass::Local;
-	}
-	if ( environment.underwater && monoWorldSource ) {
-		return SoundToneClass::Underwater;
-	}
-	if ( monoWorldSource ) {
-		return SoundToneClass::World;
-	}
-
-	return SoundToneClass::Neutral;
 }
 
 static AudioFilterSettings ToneFilterFromBands( float gain, float gainLF, float gainHF, bool preferBandPass ) {
@@ -775,85 +692,53 @@ static AudioFilterSettings ToneFilterFromBands( float gain, float gainLF, float 
 	gainLF = ClampFloat( gainLF, 0.0f, 1.0f );
 	gainHF = ClampFloat( gainHF, 0.0f, 1.0f );
 
-	const bool cutsLow = gainLF < kToneNeutralThreshold;
-	const bool cutsHigh = gainHF < kToneNeutralThreshold;
+	const bool cutsLow = gainLF < tone::kToneNeutralThreshold;
+	const bool cutsHigh = gainHF < tone::kToneNeutralThreshold;
 	if ( preferBandPass || ( cutsLow && cutsHigh ) ) {
 		return BandPassFilter( gain, gainLF, gainHF );
 	}
 	if ( cutsLow ) {
 		return HighPassFilter( gain, gainLF );
 	}
-	if ( cutsHigh || gain < kToneNeutralThreshold ) {
+	if ( cutsHigh || gain < tone::kToneNeutralThreshold ) {
 		return LowPassFilter( gain, gainHF );
 	}
 	return NoFilter();
 }
 
-static VoiceToneSettings BuildVoiceToneSettings( const SoundVoice &voice, const EnvironmentState &environment, bool listenerAttached, bool localOnly, bool stereoSample, bool monoWorldSource, float occlusion, float directHF, float wetGain, float wetGainHF ) {
+static VoiceToneSettings BuildVoiceToneSettings( const SoundVoice &voice, const EnvironmentState &environment, bool listenerAttached, bool localOnly, bool stereoSample, bool positionalSource, float occlusion, float directHF, float wetGain, float wetGainHF ) {
 	VoiceToneSettings settings;
-	settings.soundClass = ClassifyVoiceTone( voice, environment, listenerAttached, localOnly, stereoSample, monoWorldSource );
 
-	if ( settings.soundClass == SoundToneClass::Stereo || settings.soundClass == SoundToneClass::Multichannel ) {
+	tone::ToneClassInputs classInputs;
+	classInputs.channelClass = ToneClassForChannel( voice.entchannel );
+	classInputs.sampleName = ( voice.sample != nullptr ) ? voice.sample->Name().c_str() : nullptr;
+	classInputs.stereoSample = stereoSample;
+	classInputs.multichannelSample = ( voice.sample != nullptr && voice.sample->Channels() > kDefaultStreamChannels );
+	classInputs.listenerAttached = listenerAttached;
+	classInputs.localOnly = localOnly;
+	classInputs.positionalSource = positionalSource;
+	classInputs.underwater = ( environment.underwater != qfalse );
+	settings.soundClass = tone::ClassifyToneClass( classInputs );
+
+	if ( tone::ToneClassKeepsAuthoredPath( settings.soundClass, positionalSource ) ) {
 		if ( wetGain > 0.001f && !localOnly ) {
 			settings.sendTone = LowPassFilter( wetGain, wetGainHF );
 		}
 		return settings;
 	}
 
-	float directLF = ClampFloat( environment.directLF, 0.0f, 1.0f );
-	float shapedDirectHF = ClampFloat( directHF, 0.0f, 1.0f );
-	float sendLF = ClampFloat( environment.wetLF, 0.0f, 1.0f );
-	float shapedWetHF = ClampFloat( wetGainHF, 0.0f, 1.0f );
-	bool forceBandPass = false;
+	tone::ToneEnvironmentBands environmentBands;
+	environmentBands.directLF = environment.directLF;
+	environmentBands.directHF = environment.directHF;
+	environmentBands.wetLF = environment.wetLF;
+	environmentBands.wetHF = environment.wetHF;
+	environmentBands.underwater = ( environment.underwater != qfalse );
 
-	switch ( settings.soundClass ) {
-	case SoundToneClass::Announcer:
-		directLF = ( std::min )( directLF, 1.0f - kToneAnnouncerLowCut );
-		shapedDirectHF = 1.0f;
-		break;
-	case SoundToneClass::Local:
-		directLF = ( std::min )( directLF, 1.0f - kToneLocalLowCut );
-		shapedDirectHF = 1.0f;
-		break;
-	case SoundToneClass::Item:
-		directLF = ( std::min )( directLF, 1.0f - kToneItemLowCut );
-		break;
-	case SoundToneClass::Voice:
-		directLF = ( std::min )( directLF, 1.0f - kToneVoiceLowCut );
-		shapedDirectHF = ( std::min )( shapedDirectHF, 0.96f );
-		break;
-	case SoundToneClass::Body:
-		shapedDirectHF = ( std::min )( shapedDirectHF, 1.0f - kToneBodyHighCut );
-		break;
-	case SoundToneClass::Weapon:
-		directLF = ( std::min )( directLF, 0.98f );
-		// Preserve the transient crack of gunfire against the ambient
-		// environment HF cut; occlusion and underwater still shape it below.
-		shapedDirectHF = ( std::max )( shapedDirectHF, 0.97f );
-		break;
-	default:
-		break;
-	}
+	const tone::ToneBands bands = tone::ShapeToneBands( settings.soundClass, environmentBands, directHF, wetGainHF, occlusion );
 
-	if ( environment.underwater && settings.soundClass != SoundToneClass::Announcer && settings.soundClass != SoundToneClass::Local ) {
-		directLF = ( std::min )( directLF, 1.0f - kToneUnderwaterLowCut );
-		shapedDirectHF = ( std::min )( shapedDirectHF, environment.directHF * ( 1.0f - kToneUnderwaterHighCut ) );
-		sendLF = ( std::min )( sendLF, 0.82f );
-		shapedWetHF = ( std::min )( shapedWetHF, environment.wetHF * ( 1.0f - kToneUnderwaterHighCut ) );
-		forceBandPass = true;
-	}
-
-	if ( occlusion >= kToneStrongOcclusionThreshold && settings.soundClass != SoundToneClass::Announcer &&
-		settings.soundClass != SoundToneClass::Local ) {
-		const float occlusionBlend = ClampFloat( ( occlusion - kToneStrongOcclusionThreshold ) / ( 1.0f - kToneStrongOcclusionThreshold ), 0.0f, 1.0f );
-		directLF = ( std::min )( directLF, 1.0f - occlusionBlend * kToneStrongOcclusionLowCut );
-		sendLF = ( std::min )( sendLF, 1.0f - occlusionBlend * 0.12f );
-		forceBandPass = true;
-	}
-
-	settings.directTone = ToneFilterFromBands( 1.0f, directLF, shapedDirectHF, forceBandPass );
+	settings.directTone = ToneFilterFromBands( 1.0f, bands.directLF, bands.directHF, bands.bandPass );
 	if ( wetGain > 0.001f && !localOnly ) {
-		settings.sendTone = ToneFilterFromBands( wetGain, sendLF, shapedWetHF, forceBandPass );
+		settings.sendTone = ToneFilterFromBands( wetGain, bands.sendLF, bands.sendHF, bands.bandPass );
 	}
 
 	return settings;
@@ -956,6 +841,10 @@ static const char *VoiceRouteName( const SoundVoice &voice ) {
 	return "relative";
 }
 
+// One slot per SoundToneClass, with headroom so a new class cannot silently
+// drop out of the dump-only aggregation.
+constexpr size_t kMaxSourceClassDebugCounters = 16;
+
 struct SourceClassDebugCounter {
 	const char *className = nullptr;
 	int loops = 0;
@@ -968,7 +857,7 @@ struct SourceClassDebugCounter {
 	float peakGain = 0.0f;
 };
 
-static SourceClassDebugCounter *FindOrAddSourceClassDebugCounter( std::array<SourceClassDebugCounter, 12> &counters, int &counterCount, const char *className ) {
+static SourceClassDebugCounter *FindOrAddSourceClassDebugCounter( std::array<SourceClassDebugCounter, kMaxSourceClassDebugCounters> &counters, int &counterCount, const char *className ) {
 	if ( className == nullptr ) {
 		className = "neutral";
 	}
@@ -989,7 +878,7 @@ static SourceClassDebugCounter *FindOrAddSourceClassDebugCounter( std::array<Sou
 	return &counter;
 }
 
-static void AccumulateSourceClassDebugCounter( std::array<SourceClassDebugCounter, 12> &counters, int &counterCount, const SoundVoice &voice ) {
+static void AccumulateSourceClassDebugCounter( std::array<SourceClassDebugCounter, kMaxSourceClassDebugCounters> &counters, int &counterCount, const SoundVoice &voice ) {
 	if ( !voice.active ) {
 		return;
 	}
@@ -1607,7 +1496,7 @@ void Q3SoundWorld::ApplyVoice( SoundVoice &voice, qboolean softMuted ) {
 	voice.debugDistance = DistanceBetweenPoints( voiceOrigin, listenerOrigin_.Data() );
 	voice.debugPositional = positionalSource;
 	voice.debugDirect = directStereoSource;
-	voice.debugToneClass = SoundToneClassName( toneSettings.soundClass );
+	voice.debugToneClass = tone::SoundToneClassName( toneSettings.soundClass );
 	voice.debugDirectTone = AudioFilterKindName( toneSettings.directTone.kind );
 	voice.debugSendTone = AudioFilterKindName( toneSettings.sendTone.kind );
 	voice.debugDirectToneLF = toneSettings.directTone.gainLF;
@@ -1815,7 +1704,7 @@ void Q3SoundWorld::DumpSpatialDebug( const OpenALDevice &device, int preferredEn
 	const SoundVoice *selected = SelectDebugVoice( preferredEntity );
 	std::array<char, 64> environmentSummary;
 	std::array<char, 128> zoneSummary;
-	std::array<SourceClassDebugCounter, 12> sourceClassCounters = {};
+	std::array<SourceClassDebugCounter, kMaxSourceClassDebugCounters> sourceClassCounters = {};
 	int sourceClassCounterCount = 0;
 
 	FormatEnvironmentSummary( environment_, environmentSummary.data(), environmentSummary.size() );

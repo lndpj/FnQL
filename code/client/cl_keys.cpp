@@ -697,9 +697,19 @@ static qboolean CL_ShouldOpenJoinMenu( void ) {
 CL_ActivateNativeMenu
 
 Activates a menu owned by the retail UI module and transfers input to it.
+
+Ownership is claimed unconditionally, as retail does.  Do not gate this on
+UI_MENUS_ANY_VISIBLE: that recovered slot is only established for the
+fullscreen main menu, and withholding KEYCATCH_UI here takes the in-game menu's
+draw pass (SCR_DrawScreenField) and its absolute-pointer cursor and mouse grab
+(IN_AbsolutePointerOwnerKind) down with it.
 =============
 */
 static void CL_ActivateNativeMenu( uiMenuCommand_t menu ) {
+	if ( !uivm ) {
+		return;
+	}
+
 	// Browser capture has priority over native UI input. Retail releases it
 	// before opening an in-game menu so the UI receives absolute mouse motion
 	// and can draw its own cursor.
@@ -746,9 +756,13 @@ static void CL_ToggleMenuInternal( int key, qboolean sendKeyUp, unsigned time ) 
 		// retail transfers Escape to the native in-game/join menu. This also
 		// recovers if a late WebUI callback re-arms browser input after the
 		// connection transition has already hidden its surface.
-		if ( cls.state != CA_ACTIVE || clc.demoplaying ) {
+		if ( CL_WebHost_HasDrawableSurface()
+			&& ( cls.state != CA_ACTIVE || clc.demoplaying ) ) {
 			return;
 		}
+		// Either play is active, or the input claim outlived the surface that
+		// could have drawn a menu. A browser with nothing to present cannot
+		// consume Escape, so release it rather than dropping the key.
 		CL_WebHost_HideForGameTransition();
 	}
 
@@ -769,6 +783,14 @@ static void CL_ToggleMenuInternal( int key, qboolean sendKeyUp, unsigned time ) 
 			return;
 		}
 	}
+
+	// A spectator that reaches the join menu and finds Escape inert afterwards
+	// leaves no other trace, so record the ownership state every toggle starts
+	// from. This costs nothing outside `developer 1` and needs no call into the
+	// UI module, whose own menu-stack query is not established for in-game
+	// menus.
+	Com_DPrintf( "CL_ToggleMenuInternal: catcher 0x%04x state %i join %i\n",
+		Key_GetCatcher(), (int)cls.state, (int)openJoinMenu );
 
 	if ( !( Key_GetCatcher( ) & KEYCATCH_UI ) ) {
 		if ( !uivm ) {
@@ -1030,6 +1052,14 @@ void CL_CharEvent( int key )
 		return;
 	}
 
+	// The browser takes composed characters, not the UTF-8 byte stream the
+	// legacy consumers below want, so it is served before the encoding split.
+	if ( !( Key_GetCatcher( ) & KEYCATCH_CONSOLE )
+		&& ( Key_GetCatcher( ) & KEYCATCH_BROWSER ) ) {
+		CL_WebView_OnCharEvent( static_cast<int>( *codepoint ) );
+		return;
+	}
+
 	const fnql::input::Utf8Codepoint encoded = fnql::input::EncodeUtf8( *codepoint );
 	for ( std::size_t i = 0; i < encoded.size; ++i ) {
 		const int utf8Byte = encoded.bytes[i];
@@ -1038,8 +1068,6 @@ void CL_CharEvent( int key )
 		// a time. ASCII/control input therefore remains byte-for-byte unchanged.
 		if ( Key_GetCatcher( ) & KEYCATCH_CONSOLE ) {
 			Con_CharEvent( utf8Byte );
-		} else if ( Key_GetCatcher( ) & KEYCATCH_BROWSER ) {
-			CL_WebView_OnKeyEvent( utf8Byte | K_CHAR_FLAG, qtrue );
 		} else if ( Key_GetCatcher( ) & KEYCATCH_UI ) {
 			VM_Call( uivm, 3, UI_KEY_EVENT, utf8Byte | K_CHAR_FLAG, qtrue, cls.realtime );
 		} else if ( Key_GetCatcher( ) & KEYCATCH_MESSAGE ) {

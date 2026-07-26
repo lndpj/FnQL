@@ -1,6 +1,7 @@
 #include "tr_local.h"
 #include "vk.h"
 #include "../renderercommon/tr_motion_blur.h"
+#include "../renderercommon/tr_underwater.h"
 
 #if defined (_DEBUG)
 #define USE_VK_VALIDATION
@@ -2019,6 +2020,34 @@ static void vk_create_render_passes( void )
 
 		VK_CHECK( qvkCreateRenderPass( device, &desc, NULL, &vk.render_pass.motion_blur ) );
 		SET_OBJECT_NAME( vk.render_pass.motion_blur, "render pass - motion blur", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
+	}
+
+	if ( r_underwater && r_underwater->integer ) {
+		/* Single-sample scratch target for the submerged-view composite. */
+		desc.attachmentCount = 1;
+		desc.dependencyCount = 2;
+		desc.pDependencies = &deps[0];
+
+		colorRef0.attachment = 0;
+		colorRef0.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+		Com_Memset( &subpass, 0, sizeof( subpass ) );
+		subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+		subpass.colorAttachmentCount = 1;
+		subpass.pColorAttachments = &colorRef0;
+		desc.pSubpasses = &subpass;
+
+		attachments[0].flags = 0;
+		attachments[0].format = vk.color_format;
+		attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
+		attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+		attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+		attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+		attachments[0].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+		attachments[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+		VK_CHECK( qvkCreateRenderPass( device, &desc, NULL, &vk.render_pass.underwater ) );
+		SET_OBJECT_NAME( vk.render_pass.underwater, "render pass - underwater view", VK_DEBUG_REPORT_OBJECT_TYPE_RENDER_PASS_EXT );
 	}
 
 	// SDR capture render pass (normal screenshots and cubemap face extraction)
@@ -4144,6 +4173,15 @@ void vk_update_attachment_descriptors( void ) {
 			vk_update_descriptor_sets( 1, &desc );
 		}
 
+		if ( vk.underwater_image_view && vk.underwater_descriptor ) {
+			sd.gl_mag_filter = sd.gl_min_filter = vk.blitFilter;
+			sd.max_lod_1_0 = qtrue;
+			info.sampler = vk_find_sampler( &sd );
+			info.imageView = vk.underwater_image_view;
+			desc.dstSet = vk.underwater_descriptor;
+			vk_update_descriptor_sets( 1, &desc );
+		}
+
 		// screenmap
 		sd.gl_mag_filter = sd.gl_min_filter = GL_LINEAR;
 		sd.max_lod_1_0 = qfalse;
@@ -4359,6 +4397,10 @@ void vk_init_descriptors( void )
 		if ( vk.motion_blur_image_view ) {
 			VK_CHECK( qvkAllocateDescriptorSets( vk.device, &alloc, &vk.motion_blur_descriptor ) );
 			SET_OBJECT_NAME( vk.motion_blur_descriptor, "motion blur scratch descriptor", VK_DEBUG_REPORT_OBJECT_TYPE_DESCRIPTOR_SET_EXT );
+		}
+		if ( vk.underwater_image_view ) {
+			VK_CHECK( qvkAllocateDescriptorSets( vk.device, &alloc, &vk.underwater_descriptor ) );
+			SET_OBJECT_NAME( vk.underwater_descriptor, "underwater view scratch descriptor", VK_DEBUG_REPORT_OBJECT_TYPE_DESCRIPTOR_SET_EXT );
 		}
 
 		if ( r_bloom->integer )
@@ -4836,6 +4878,10 @@ static void vk_create_shader_modules( void )
 		vk.modules.global_fog_fs = SHADER_MODULE_OPTIONAL( global_fog_frag_spv,
 			sizeof( global_fog_frag_spv ), "global fog" );
 	}
+	if ( r_underwater && r_underwater->integer ) {
+		vk.modules.underwater_fs = SHADER_MODULE_OPTIONAL( underwater_frag_spv,
+			sizeof( underwater_frag_spv ), "underwater view" );
+	}
 
 	SET_OBJECT_NAME( vk.modules.bloom_fs, "bloom extraction fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	SET_OBJECT_NAME( vk.modules.blur_fs, "gaussian blur fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
@@ -4844,6 +4890,9 @@ static void vk_create_shader_modules( void )
 	SET_OBJECT_NAME( vk.modules.world_outline_fs, "world cel depth-outline fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	if ( vk.modules.global_fog_fs != VK_NULL_HANDLE ) {
 		SET_OBJECT_NAME( vk.modules.global_fog_fs, "global fog fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
+	}
+	if ( vk.modules.underwater_fs != VK_NULL_HANDLE ) {
+		SET_OBJECT_NAME( vk.modules.underwater_fs, "underwater view fragment module", VK_DEBUG_REPORT_OBJECT_TYPE_SHADER_MODULE_EXT );
 	}
 
 	vk.modules.gamma_fs = SHADER_MODULE( gamma_frag_spv );
@@ -5414,6 +5463,11 @@ void vk_update_post_process_pipelines( void )
 		if ( r_motionBlur && r_motionBlur->integer ) {
 			vk_create_post_process_pipeline( 6, glConfig.vidWidth, glConfig.vidHeight );
 			vk_create_post_process_pipeline( 7, glConfig.vidWidth, glConfig.vidHeight );
+		}
+		if ( r_underwater && r_underwater->integer &&
+			vk.modules.underwater_fs != VK_NULL_HANDLE ) {
+			vk_create_post_process_pipeline( 11, glConfig.vidWidth, glConfig.vidHeight );
+			vk_create_post_process_pipeline( 12, glConfig.vidWidth, glConfig.vidHeight );
 		}
 		if ( r_liquid && r_liquid->integer ) {
 			vk_create_post_process_pipeline( 9,
@@ -6093,6 +6147,11 @@ static void vk_create_attachments( void )
 				usage, &vk.motion_blur_image, &vk.motion_blur_image_view,
 				VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, qfalse );
 		}
+		if ( r_underwater && r_underwater->integer ) {
+			create_color_attachment( glConfig.vidWidth, glConfig.vidHeight, VK_SAMPLE_COUNT_1_BIT, vk.color_format,
+				usage, &vk.underwater_image, &vk.underwater_image_view,
+				VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, qfalse );
+		}
 		if ( r_liquid && r_liquid->integer &&
 			vk.liquidSnapshotWidth > 0 && vk.liquidSnapshotHeight > 0 ) {
 			create_color_attachment( vk.liquidSnapshotWidth, vk.liquidSnapshotHeight,
@@ -6286,6 +6345,17 @@ static void vk_create_framebuffers( void )
 		framebufferAttachments[0] = vk.motion_blur_image_view;
 		VK_CHECK( qvkCreateFramebuffer( vk.device, &desc, NULL, &vk.framebuffers.motion_blur ) );
 		SET_OBJECT_NAME( vk.framebuffers.motion_blur, "framebuffer - motion blur scratch", VK_DEBUG_REPORT_OBJECT_TYPE_FRAMEBUFFER_EXT );
+	}
+
+	if ( vk.render_pass.underwater != VK_NULL_HANDLE &&
+		vk.underwater_image_view != VK_NULL_HANDLE ) {
+		desc.renderPass = vk.render_pass.underwater;
+		desc.attachmentCount = 1;
+		desc.width = glConfig.vidWidth;
+		desc.height = glConfig.vidHeight;
+		framebufferAttachments[0] = vk.underwater_image_view;
+		VK_CHECK( qvkCreateFramebuffer( vk.device, &desc, NULL, &vk.framebuffers.underwater ) );
+		SET_OBJECT_NAME( vk.framebuffers.underwater, "framebuffer - underwater view scratch", VK_DEBUG_REPORT_OBJECT_TYPE_FRAMEBUFFER_EXT );
 	}
 
 	if ( vk.render_pass.dlight_shadow != VK_NULL_HANDLE && vk.dlight_shadow_image_view != VK_NULL_HANDLE )
@@ -6564,6 +6634,10 @@ static void vk_destroy_framebuffers( void ) {
 	if ( vk.framebuffers.motion_blur != VK_NULL_HANDLE ) {
 		qvkDestroyFramebuffer( vk.device, vk.framebuffers.motion_blur, NULL );
 		vk.framebuffers.motion_blur = VK_NULL_HANDLE;
+	}
+	if ( vk.framebuffers.underwater != VK_NULL_HANDLE ) {
+		qvkDestroyFramebuffer( vk.device, vk.framebuffers.underwater, NULL );
+		vk.framebuffers.underwater = VK_NULL_HANDLE;
 	}
 
 	if ( vk.framebuffers.screenmap != VK_NULL_HANDLE ) {
@@ -7039,7 +7113,11 @@ void vk_initialize( void )
 		push_range.size = 64; // 16 floats
 		post_push_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 		post_push_range.offset = 0;
-		post_push_range.size = 48; // global-fog color, mode, and depth reconstruction
+		/* The submerged-view compositor is the largest consumer at eight vec4s.
+		 * 128 bytes is the Vulkan guaranteed minimum, so every compliant device
+		 * accepts this range and the smaller post-process passes ignore the
+		 * unused tail. */
+		post_push_range.size = 128; // underwater wave field, medium, and depth reconstruction
 
 		// standard pipelines
 		set_layouts[0] = vk.set_layout_uniform; // fog/dlight parameters
@@ -7207,6 +7285,7 @@ static void vk_destroy_attachments( void )
 
 	vk_destroy_image_and_view( &vk.color_image, &vk.color_image_view );
 	vk_destroy_image_and_view( &vk.motion_blur_image, &vk.motion_blur_image_view );
+	vk_destroy_image_and_view( &vk.underwater_image, &vk.underwater_image_view );
 	vk_destroy_image_and_view( &vk.liquidSnapshot.color_image,
 		&vk.liquidSnapshot.color_image_view );
 	vk_destroy_image_and_view( &vk.msaa_image, &vk.msaa_image_view );
@@ -7285,6 +7364,10 @@ static void vk_destroy_render_passes( void )
 		qvkDestroyRenderPass( vk.device, vk.render_pass.motion_blur, NULL );
 		vk.render_pass.motion_blur = VK_NULL_HANDLE;
 	}
+	if ( vk.render_pass.underwater != VK_NULL_HANDLE ) {
+		qvkDestroyRenderPass( vk.device, vk.render_pass.underwater, NULL );
+		vk.render_pass.underwater = VK_NULL_HANDLE;
+	}
 
 	if ( vk.render_pass.dlight_shadow != VK_NULL_HANDLE ) {
 		qvkDestroyRenderPass( vk.device, vk.render_pass.dlight_shadow, NULL );
@@ -7343,6 +7426,14 @@ static void vk_destroy_pipelines( qboolean resetCounter )
 	if ( vk.motion_blur_copy_pipeline != VK_NULL_HANDLE ) {
 		qvkDestroyPipeline( vk.device, vk.motion_blur_copy_pipeline, NULL );
 		vk.motion_blur_copy_pipeline = VK_NULL_HANDLE;
+	}
+	if ( vk.underwater_pipeline != VK_NULL_HANDLE ) {
+		qvkDestroyPipeline( vk.device, vk.underwater_pipeline, NULL );
+		vk.underwater_pipeline = VK_NULL_HANDLE;
+	}
+	if ( vk.underwater_copy_pipeline != VK_NULL_HANDLE ) {
+		qvkDestroyPipeline( vk.device, vk.underwater_copy_pipeline, NULL );
+		vk.underwater_copy_pipeline = VK_NULL_HANDLE;
 	}
 	if ( vk.liquid_snapshot_pipeline != VK_NULL_HANDLE ) {
 		qvkDestroyPipeline( vk.device, vk.liquid_snapshot_pipeline, NULL );
@@ -7517,6 +7608,10 @@ void vk_shutdown( refShutdownCode_t code )
 	if ( vk.modules.global_fog_fs != VK_NULL_HANDLE ) {
 		qvkDestroyShaderModule( vk.device, vk.modules.global_fog_fs, NULL );
 		vk.modules.global_fog_fs = VK_NULL_HANDLE;
+	}
+	if ( vk.modules.underwater_fs != VK_NULL_HANDLE ) {
+		qvkDestroyShaderModule( vk.device, vk.modules.underwater_fs, NULL );
+		vk.modules.underwater_fs = VK_NULL_HANDLE;
 	}
 
 	qvkDestroyShaderModule(vk.device, vk.modules.gamma_vs, NULL);
@@ -8097,6 +8192,26 @@ void vk_create_post_process_pipeline( int program_index, uint32_t width, uint32_
 			pipeline_name = "motion blur scene copy pipeline";
 			blend = qfalse;
 			break;
+		case 11: // submerged-view composite into the scratch attachment
+			pipeline = &vk.underwater_pipeline;
+			fsmodule = vk.modules.underwater_fs;
+			renderpass = vk.render_pass.underwater;
+			layout = vk.pipeline_layout_post_process;
+			samples = VK_SAMPLE_COUNT_1_BIT;
+			pipeline_name = "underwater view scene pipeline";
+			blend = qfalse;
+			optional = qtrue;
+			break;
+		case 12: // copy the composited scratch image back to the main scene target
+			pipeline = &vk.underwater_copy_pipeline;
+			fsmodule = vk.modules.underwater_fs;
+			renderpass = vk.render_pass.main_load;
+			layout = vk.pipeline_layout_post_process;
+			samples = vkSamples;
+			pipeline_name = "underwater view scene copy pipeline";
+			blend = qfalse;
+			optional = qtrue;
+			break;
 		case 8: // crop and transform a square cubemap face into the readback scratch target
 			pipeline = &vk.cubemap_capture.pipeline;
 			fsmodule = vk.modules.gamma_fs;
@@ -8583,9 +8698,11 @@ void vk_create_post_process_pipeline( int program_index, uint32_t width, uint32_
 				qvkDestroyPipeline( vk.device, *pipeline, NULL );
 				*pipeline = VK_NULL_HANDLE;
 			}
+			/* Name the pipeline rather than assuming which optional feature
+			 * this is: more than one now takes this path. */
 			ri.Printf( PRINT_WARNING,
-				"WARNING: Vulkan optional global fog pipeline failed (%s); feature disabled\n",
-				vk_result_string( createResult ) );
+				"WARNING: Vulkan optional %s failed (%s); feature disabled\n",
+				pipeline_name, vk_result_string( createResult ) );
 			return;
 		}
 	} else {
@@ -10956,8 +11073,16 @@ static qboolean vk_depth_fade_uses_depth_resolve( void )
 
 static qboolean vk_depth_fade_requested( void )
 {
+	/* Enhanced liquids reject warped refraction samples that land on geometry
+	 * nearer than the liquid surface, so they need the copied opaque depth even
+	 * when soft particles are off. The main pass already keeps its depth
+	 * attachment for the capture; without this the copy target is never created
+	 * and the waterline silently smears. FBO_CopyLiquidDepth decouples the same
+	 * copy from r_depthFade on the OpenGL-lineage backend. */
 	return ( ( r_depthFade && r_depthFade->integer ) || R_CelShadingWorldActive() ||
-		( r_globalFog && r_globalFog->integer ) ) ? qtrue : qfalse;
+		( r_globalFog && r_globalFog->integer ) ||
+		( r_underwater && r_underwater->integer ) ||
+		( r_fbo->integer && r_liquid && r_liquid->integer ) ) ? qtrue : qfalse;
 }
 
 
@@ -11333,7 +11458,10 @@ void vk_draw_global_fog( void )
 {
 	const globalFog_t *fog = tr.world ? &tr.world->globalFog : NULL;
 	float constants[12];
+	qboolean sceneLinear;
+	vec3_t sceneColor;
 	float opacity;
+	float outputScale;
 	float zNear;
 	float zFar;
 	VkDescriptorSet descriptor;
@@ -11354,9 +11482,18 @@ void vk_draw_global_fog( void )
 		return;
 	}
 
-	constants[0] = fog->color[0];
-	constants[1] = fog->color[1];
-	constants[2] = fog->color[2];
+	/* Match the gamma pipeline's obScale/tone-map exposure so the authored
+	 * color survives the output transform unchanged. */
+	sceneLinear = ( r_hdr && r_hdr->integer > 0 ) ? qtrue : qfalse;
+	outputScale = (float)( 1 << tr.overbrightBits );
+	if ( sceneLinear && r_tonemapExposure ) {
+		outputScale *= Com_Clamp( 0.1f, 8.0f, r_tonemapExposure->value );
+	}
+	R_GlobalFogSceneColor( fog, outputScale, sceneLinear, sceneColor );
+
+	constants[0] = sceneColor[0];
+	constants[1] = sceneColor[1];
+	constants[2] = sceneColor[2];
 	constants[3] = opacity;
 	constants[4] = fog->start;
 	constants[5] = fog->end;
@@ -12061,6 +12198,7 @@ qboolean vk_capture_cubemap_face( uint32_t faceIndex, uint32_t faceSize )
 	backEnd.doneSurfaces = qfalse;
 	backEnd.doneBloom = qfalse;
 	backEnd.doneMotionBlur = qfalse;
+	backEnd.doneUnderwater = qfalse;
 	return qtrue;
 }
 
@@ -12462,6 +12600,201 @@ qboolean vk_motion_blur( void )
 	vk.cmd->depth_range = DEPTH_RANGE_COUNT;
 	vk.cmd->descriptor_set.start = 0;
 	vk.cmd->descriptor_set.end = VK_DESC_COUNT - 1;
+	return qtrue;
+}
+
+
+/*
+====================
+vk_draw_underwater
+
+Composites the optional submerged view over the completed 3D scene: the whole
+frame is resampled through an animated wave field with a small per-channel
+dispersion, darkened toward the periphery, and absorbed toward the medium color
+with eye distance.  It runs after global fog and before motion blur, bloom, and
+gamma, so the layer belongs to the scene while later HUD and console drawing
+stays sharp.
+
+The effect draw renders into a private scratch attachment while sampling the
+main color and the copied opaque depth, so it never reads the attachment it is
+writing; a second draw with a zeroed warp, edge, and fog copies the result back.
+When the depth copy is unavailable the medium density is uploaded as zero, which
+leaves the warp and the edge falloff intact instead of dropping the whole layer.
+====================
+*/
+qboolean vk_draw_underwater( void )
+{
+	vec4_t phaseCoeffs[UNDERWATER_WAVE_OCTAVES];
+	vec3_t dirAmp[UNDERWATER_WAVE_OCTAVES];
+	vec3_t sceneColor;
+	VkDescriptorSet sets[2];
+	float constants[32];
+	qboolean sceneLinear;
+	qboolean depthReady;
+	float strength;
+	float warpScale;
+	float warpPixels;
+	float dispersion;
+	float fogScale;
+	float vignette;
+	float waveTime;
+	float density;
+	float outputScale;
+	float zNear;
+	float zFar;
+	float aspect;
+	int contents;
+	int i;
+
+	if ( !r_underwater || !r_underwater->integer || !r_underwaterWarp ||
+		!r_underwaterDispersion || !r_underwaterFog || !r_underwaterVignette ) {
+		return qfalse;
+	}
+	if ( backEnd.doneUnderwater || !backEnd.doneSurfaces || !vk.fboActive ||
+		( backEnd.refdef.rdflags & RDF_NOWORLDMODEL ) ) {
+		return qfalse;
+	}
+	/* Recursive portal and mirror views are submitted before the primary view
+	 * and carry their own camera.  The medium belongs to the eye, so the layer
+	 * composites once, over the primary view only. */
+	if ( R_ViewPassIsPortal( &backEnd.viewParms ) ) {
+		return qfalse;
+	}
+	if ( backEnd.screenshotCubeActive || backEnd.screenshotCubeFrontPending ) {
+		return qfalse;
+	}
+	if ( vk.renderPassIndex != RENDER_PASS_MAIN ) {
+		return qfalse;
+	}
+	/* A stereo pair would need one composite per eye; the once-per-frame guard
+	 * deliberately keeps this to the single-view case rather than half-applying
+	 * the layer. */
+	if ( ri.CL_IsMinimized() || glConfig.stereoEnabled ||
+		vk.underwater_image == VK_NULL_HANDLE ||
+		vk.underwater_descriptor == VK_NULL_HANDLE ||
+		vk.framebuffers.underwater == VK_NULL_HANDLE ||
+		vk.underwater_pipeline == VK_NULL_HANDLE ||
+		vk.underwater_copy_pipeline == VK_NULL_HANDLE ) {
+		return qfalse;
+	}
+
+	strength = backEnd.refdef.underwaterStrength;
+	contents = backEnd.refdef.underwaterContents & UNDERWATER_CONTENTS_MASK;
+	if ( strength <= 0.0f || !contents ) {
+		return qfalse;
+	}
+
+	/* Projective coordinates cover the whole target, so a reduced or sub-rect
+	 * 3D viewport would warp and darken screen area the view does not own. */
+	if ( !R_LiquidViewportCoversTarget( backEnd.viewParms.viewportX,
+		backEnd.viewParms.viewportY, backEnd.viewParms.viewportWidth,
+		backEnd.viewParms.viewportHeight, glConfig.vidWidth, glConfig.vidHeight ) ) {
+		return qfalse;
+	}
+
+	warpScale = Com_Clamp( 0.0f, UNDERWATER_WARP_SCALE_MAX, r_underwaterWarp->value ) *
+		R_UnderwaterContentsWarpScale( contents );
+	warpPixels = R_UnderwaterWarpPixels( warpScale, glConfig.vidHeight ) * strength;
+	dispersion = R_UnderwaterDispersion( r_underwaterDispersion->value );
+	fogScale = Com_Clamp( 0.0f, 1.0f, r_underwaterFog->value ) * strength;
+	vignette = Com_Clamp( 0.0f, 1.0f, r_underwaterVignette->value ) * strength;
+	if ( warpPixels <= 0.0f && fogScale <= 0.0f && vignette <= 0.0f ) {
+		return qfalse;
+	}
+
+	zNear = r_znear ? r_znear->value : 4.0f;
+	zFar = backEnd.viewParms.zFar;
+	if ( zNear <= 0.0f || zFar <= zNear ) {
+		return qfalse;
+	}
+
+	depthReady = ( vk_depth_fade_ready() && vk.depth_fade_descriptor != VK_NULL_HANDLE ) ?
+		qtrue : qfalse;
+	density = depthReady ? R_UnderwaterContentsDensity( contents ) : 0.0f;
+
+	/* Match the gamma pipeline's obScale and tone-map exposure so the authored
+	 * medium color survives the output transform unchanged. */
+	sceneLinear = ( r_hdr && r_hdr->integer > 0 ) ? qtrue : qfalse;
+	outputScale = (float)( 1 << tr.overbrightBits );
+	if ( sceneLinear && r_tonemapExposure ) {
+		outputScale *= Com_Clamp( 0.1f, 8.0f, r_tonemapExposure->value );
+	}
+	R_UnderwaterSceneColor( contents, outputScale, sceneLinear, sceneColor );
+
+	backEnd.doneUnderwater = qtrue;
+
+	waveTime = R_UnderwaterWaveTime( backEnd.refdef.floatTime );
+	for ( i = 0; i < UNDERWATER_WAVE_OCTAVES; i++ ) {
+		R_UnderwaterWaveOctave( i, phaseCoeffs[i], dirAmp[i] );
+		/* The octave speed travels pre-multiplied by the wrapped scene time so
+		 * the fragment stage evaluates a plain dot product plus a constant. */
+		phaseCoeffs[i][3] *= waveTime;
+	}
+	aspect = glConfig.vidHeight > 0 ?
+		(float)glConfig.vidWidth / (float)glConfig.vidHeight : 1.0f;
+
+	Com_Memset( constants, 0, sizeof( constants ) );
+	for ( i = 0; i < UNDERWATER_WAVE_OCTAVES; i++ ) {
+		constants[0 + i] = phaseCoeffs[i][0] * aspect;
+		constants[4 + i] = phaseCoeffs[i][1];
+		constants[8 + i] = phaseCoeffs[i][3];
+		constants[12 + i] = dirAmp[i][0];
+		constants[16 + i] = dirAmp[i][1];
+	}
+	constants[15] = 1.0f + dispersion;
+	constants[19] = 1.0f - dispersion;
+	constants[20] = sceneColor[0];
+	constants[21] = sceneColor[1];
+	constants[22] = sceneColor[2];
+	constants[23] = UNDERWATER_FOG_MAX_OPACITY * strength;
+	constants[24] = density;
+	constants[25] = zNear * zFar;
+	constants[26] = zNear;
+	constants[27] = zFar - zNear;
+	constants[28] = warpPixels / (float)glConfig.vidWidth;
+	constants[29] = warpPixels / (float)glConfig.vidHeight;
+	constants[30] = vignette;
+	constants[31] = fogScale;
+
+	sets[0] = vk.color_descriptor;
+	sets[1] = depthReady ? vk.depth_fade_descriptor : vk.color_descriptor;
+
+	vk_end_render_pass();
+	vk_begin_render_pass( vk.render_pass.underwater, vk.framebuffers.underwater,
+		qfalse, glConfig.vidWidth, glConfig.vidHeight );
+	qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		vk.underwater_pipeline );
+	qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		vk.pipeline_layout_post_process, 0, ARRAY_LEN( sets ), sets, 0, NULL );
+	qvkCmdPushConstants( vk.cmd->command_buffer, vk.pipeline_layout_post_process,
+		VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof( constants ), constants );
+	qvkCmdDraw( vk.cmd->command_buffer, 4, 1, 0, 0 );
+	vk_end_render_pass();
+
+	/* Resume the main target so later HUD and console draws remain sharp.  The
+	 * copy zeroes the warp, the dispersion split, the edge falloff, and the
+	 * absorption, so the same shader resolves to a straight passthrough rather
+	 * than needing a second program. */
+	vk_begin_main_render_pass_load();
+	Com_Memset( constants, 0, sizeof( constants ) );
+	constants[15] = 1.0f;
+	constants[19] = 1.0f;
+	constants[26] = 1.0f;
+	sets[0] = vk.underwater_descriptor;
+	qvkCmdBindPipeline( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		vk.underwater_copy_pipeline );
+	qvkCmdBindDescriptorSets( vk.cmd->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+		vk.pipeline_layout_post_process, 0, ARRAY_LEN( sets ), sets, 0, NULL );
+	qvkCmdPushConstants( vk.cmd->command_buffer, vk.pipeline_layout_post_process,
+		VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof( constants ), constants );
+	qvkCmdDraw( vk.cmd->command_buffer, 4, 1, 0, 0 );
+
+	/* Direct post-process binds bypass the normal descriptor/pipeline caches. */
+	vk.cmd->last_pipeline = VK_NULL_HANDLE;
+	vk.cmd->depth_range = DEPTH_RANGE_COUNT;
+	vk.cmd->descriptor_set.start = 0;
+	vk.cmd->descriptor_set.end = VK_DESC_COUNT - 1;
+	Com_Memset( &vk.cmd->scissor_rect, 0xff, sizeof( vk.cmd->scissor_rect ) );
 	return qtrue;
 }
 

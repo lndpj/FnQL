@@ -185,8 +185,8 @@ class ReleasePackagingTests(unittest.TestCase):
             (source / "README.txt").write_text("keep", encoding="utf-8")
             (source / "baseq3" / "maps").mkdir(parents=True)
             (source / "baseq3" / "maps" / "q3dm1.azb").write_bytes(b"zones")
-            (source / "missionpack" / "vm").mkdir(parents=True)
-            (source / "missionpack" / "vm" / "cgame.qvm").write_text(
+            (source / "cpma" / "vm").mkdir(parents=True)
+            (source / "cpma" / "vm" / "cgame.qvm").write_text(
                 "mod data",
                 encoding="utf-8",
             )
@@ -208,8 +208,8 @@ class ReleasePackagingTests(unittest.TestCase):
             [
                 "README.txt",
                 "baseq3/maps/q3dm1.azb",
+                "cpma/vm/cgame.qvm",
                 "fnql.x86",
-                "missionpack/vm/cgame.qvm",
             ],
         )
         self.assertIn("renderer.pdb", skipped)
@@ -368,7 +368,7 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertEqual(len(stock_ql_maps.STOCK_QL_MAPS), 149)
         self.assertEqual(len(audio_destinations), 149)
         self.assertEqual(len(fog_destinations), 149)
-        self.assertEqual(len(required_destinations), 301)
+        self.assertEqual(len(required_destinations), 300)
         self.assertIn("pkg/baseq3/maps/campgrounds.azb", sources)
         self.assertIn("baseq3/maps/campgrounds.azb", audio_destinations)
         self.assertIn("baseq3/maps/campgrounds.fog", fog_destinations)
@@ -376,7 +376,6 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("baseq3/maps/siberia.fog", fog_destinations)
         self.assertNotIn("baseq3/maps/q3dm1.azb", audio_destinations)
         self.assertIn("baseq3/sound/fnql-weapon-sounds.sndshd", required_destinations)
-        self.assertIn("missionpack/sound/fnql-weapon-sounds.sndshd", required_destinations)
         self.assertIn("baseq3/scripts/fnql.shader", required_destinations)
         self.assertNotIn("baseq3/maps/test_bigbox.azb", audio_destinations)
 
@@ -406,7 +405,7 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("map_name + '.fog'", meson_build)
         self.assertIn("'pkg/baseq3/scripts/fnql.shader'", meson_build)
         self.assertIn("'pkg/baseq3/sound/fnql-weapon-sounds.sndshd'", meson_build)
-        self.assertIn("'pkg/missionpack/sound/fnql-weapon-sounds.sndshd'", meson_build)
+        self.assertNotIn("pkg/missionpack/", meson_build)
 
     def test_root_archive_rejects_unsafe_custom_archive_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -464,8 +463,8 @@ class ReleasePackagingTests(unittest.TestCase):
                 "textures/custom {}",
                 encoding="utf-8",
             )
-            (package_root / "missionpack" / "sound" / "custom.sndshd").parent.mkdir(parents=True)
-            (package_root / "missionpack" / "sound" / "custom.sndshd").write_text(
+            (package_root / "cpma" / "sound" / "custom.sndshd").parent.mkdir(parents=True)
+            (package_root / "cpma" / "sound" / "custom.sndshd").write_text(
                 "custom {}",
                 encoding="utf-8",
             )
@@ -479,7 +478,7 @@ class ReleasePackagingTests(unittest.TestCase):
 
         self.assertIn("baseq3/maps/q3dm1.azb", names)
         self.assertIn("baseq3/scripts/custom.shader", names)
-        self.assertIn("missionpack/sound/custom.sndshd", names)
+        self.assertIn("cpma/sound/custom.sndshd", names)
         self.assertIn("baseq2/maps/q2dm1.azb", names)
         self.assertNotIn("pkg/baseq3/scripts/custom.shader", names)
 
@@ -514,8 +513,8 @@ class ReleasePackagingTests(unittest.TestCase):
             stage_root.mkdir()
             (stage_root / "fnql.x86.exe").write_text("binary", encoding="utf-8")
             (stage_root / "fnql_steam.dll").write_bytes(make_pe(dll=True))
-            (stage_root / "missionpack" / "vm").mkdir(parents=True)
-            (stage_root / "missionpack" / "vm" / "cgame.qvm").write_text(
+            (stage_root / "cpma" / "vm").mkdir(parents=True)
+            (stage_root / "cpma" / "vm" / "cgame.qvm").write_text(
                 "mod data",
                 encoding="utf-8",
             )
@@ -535,7 +534,7 @@ class ReleasePackagingTests(unittest.TestCase):
 
         self.assertIn(release.ROOT_ARCHIVE_NAME, names)
         self.assertIn(release.FNQL_WEBPAK_NAME, names)
-        self.assertIn("missionpack/vm/cgame.qvm", names)
+        self.assertIn("cpma/vm/cgame.qvm", names)
         self.assertNotIn("baseq3/maps/q3dm1.azb", names)
         self.assertIn("baseq3/maps/campgrounds.azb", root_archive_names)
         self.assertIn("baseq3/maps/campgrounds.fog", root_archive_names)
@@ -543,7 +542,6 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("baseq3/maps/bloodrun.fog", root_archive_names)
         self.assertNotIn("baseq3/maps/q3dm1.azb", root_archive_names)
         self.assertIn("baseq3/sound/fnql-weapon-sounds.sndshd", root_archive_names)
-        self.assertIn("missionpack/sound/fnql-weapon-sounds.sndshd", root_archive_names)
         self.assertNotIn("maps/q3dm1.azb", names)
 
     def test_release_archive_validation_requires_package_docs(self) -> None:

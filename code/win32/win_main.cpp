@@ -137,6 +137,47 @@ void NORETURN FORMAT_PRINTF(1, 2) QDECL Sys_Error( const char *error, ... ) {
 
 /*
 ==============
+Sys_PromptStartupChoice
+
+Modal startup notification with the three standard recovery answers.  The
+Win32 buttons map Continue -> proceed, Try Again -> retry, Cancel -> quit.
+Any failure to build or show the dialog reports SYS_STARTUP_PROCEED so an
+unattended session can never be stalled by a notification it cannot answer.
+==============
+*/
+sysStartupChoice_t Sys_PromptStartupChoice( const char *title, const char *message ) {
+	WCHAR wideTitle[128];
+	WCHAR wideMessage[2048];
+
+	if ( !message || !message[0] ) {
+		return SYS_STARTUP_PROCEED;
+	}
+
+	// Callers keep both strings well inside these buffers; an over-long or
+	// malformed conversion is treated as "no dialog is available".
+	if ( MultiByteToWideChar( CP_UTF8, 0, title && title[0] ? title : "FnQL", -1,
+			wideTitle, ARRAYSIZE( wideTitle ) ) <= 0 ) {
+		return SYS_STARTUP_PROCEED;
+	}
+	if ( MultiByteToWideChar( CP_UTF8, 0, message, -1, wideMessage,
+			ARRAYSIZE( wideMessage ) ) <= 0 ) {
+		return SYS_STARTUP_PROCEED;
+	}
+
+	switch ( MessageBoxW( g_wv.hWnd, wideMessage, wideTitle, MB_CANCELTRYCONTINUE
+		| MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TASKMODAL ) ) {
+		case IDTRYAGAIN:
+			return SYS_STARTUP_RETRY;
+		case IDCANCEL:
+			return SYS_STARTUP_QUIT;
+		default:
+			return SYS_STARTUP_PROCEED;
+	}
+}
+
+
+/*
+==============
 Sys_Quit
 ==============
 */

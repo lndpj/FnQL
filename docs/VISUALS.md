@@ -36,9 +36,9 @@ Each color cvar accepts `R G B` or `R G B A` values in `0-255` space.
 
 Default values:
 
-- `cl_playerHighlightRedColor "208 96 96"`
-- `cl_playerHighlightBlueColor "96 144 224"`
-- `cl_playerHighlightFreeColor "208 96 96"`
+- `cl_playerHighlightRedColor "255 32 0"`
+- `cl_playerHighlightBlueColor "0 32 255"`
+- `cl_playerHighlightFreeColor "255 32 0"`
 
 The same base color drives both passes. The rimlight and outline use different internal alpha strengths so they read as separate effects instead of the same shell drawn twice.
 
@@ -49,10 +49,10 @@ Overall pass intensity:
 
 Defaults:
 
-- `cl_playerHighlightRimIntensity "1.0"`
-- `cl_playerHighlightOutlineIntensity "1.0"`
+- `cl_playerHighlightRimIntensity "2.0"`
+- `cl_playerHighlightOutlineIntensity "2.0"`
 
-Use `0` to suppress that pass without changing the `cl_playerHighlight` bitmask. Values above `1` strengthen the pass until the final alpha reaches full opacity.
+Both accept `0` through `2`. Use `0` to suppress that pass without changing the `cl_playerHighlight` bitmask. Values above `1` strengthen the pass until the final alpha reaches full opacity.
 
 ## Enemy And Teammate Overrides
 
@@ -118,6 +118,14 @@ The old `cl_enemyHighlight*` names have been replaced by `cl_playerHighlight*`.
 
 - Existing archived `cl_enemyHighlight*` values are migrated forward when the new cvars are still at default values.
 - Use the `cl_playerHighlight*` names for new configs and documentation.
+
+## In The Menu
+
+The Quake Live settings menu carries these controls in its **Team** section.
+The teammate and opponent overrides sit at the bottom of the retail teammate and
+enemy columns, next to the force-model and screen-damage rows they belong with,
+and a **Player Highlighting** block below holds the mode, both pass intensities,
+the outline thickness, and the red, blue, and free-for-all colors.
 
 ## Related Guides
 

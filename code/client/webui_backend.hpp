@@ -301,6 +301,13 @@ enum class KeyboardEventType : std::uint8_t {
 	Character
 };
 
+// Browsers separate physical key presses from the text they produce, so engine
+// input has to arrive the same way.  KeyDown/KeyUp carry a platform virtual-key
+// code; Character carries one UTF-16 code unit of already-composed text (a
+// non-BMP code point is delivered as its surrogate pair, one event each).
+// Runtime-specific encodings, such as Awesomium's Win32 message triple, belong
+// in the adapter.  A zero nativeKey asks the adapter to derive the native code
+// from the virtual key rather than asserting a specific hardware scancode.
 struct KeyboardEvent {
 	KeyboardEventType type = KeyboardEventType::KeyDown;
 	std::uint32_t virtualKey = 0;
@@ -692,7 +699,14 @@ public:
 
 	BackendResult InjectKeyboard( KeyboardEvent event ) noexcept {
 		BackendResult ready = RequireRunning();
-		return ready ? Remember( backend_->InjectKeyboard( event ) ) : ready;
+		if ( !ready ) {
+			return ready;
+		}
+		if ( event.virtualKey == 0 ) {
+			return Remember( BackendResult::Failure( BackendError::InvalidArgument,
+				"WebUI keyboard event has no key or character" ) );
+		}
+		return Remember( backend_->InjectKeyboard( event ) );
 	}
 
 	BackendResult StopLoading() noexcept {

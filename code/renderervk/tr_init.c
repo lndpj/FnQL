@@ -76,6 +76,11 @@ cvar_t	*r_dynamiclight;
 cvar_t	*r_depthFade;
 cvar_t	*r_globalFog;
 cvar_t	*r_globalFogStrength;
+cvar_t	*r_underwater;
+cvar_t	*r_underwaterWarp;
+cvar_t	*r_underwaterDispersion;
+cvar_t	*r_underwaterFog;
+cvar_t	*r_underwaterVignette;
 cvar_t	*r_celShading;
 cvar_t	*r_celShadingWorld;
 cvar_t	*r_celShadingWorldWidth;
@@ -2787,6 +2792,27 @@ static void R_Register( void )
 	ri.Cvar_CheckRange( r_globalFogStrength, "0", "1", CV_FLOAT );
 	ri.Cvar_SetDescription( r_globalFogStrength, "Live opacity multiplier for the current map's optional global-fog sidecar." );
 	ri.Cvar_SetGroup( r_globalFogStrength, CVG_RENDERER );
+
+	r_underwater = ri.Cvar_Get( "r_underwater", "0", CVAR_ARCHIVE_ND | CVAR_LATCH );
+	ri.Cvar_CheckRange( r_underwater, "0", "1", CV_INTEGER );
+	ri.Cvar_SetDescription( r_underwater, "Enable the optional visual-only submerged view effect for water, slime, and lava: an animated screen warp, chromatic dispersion, distance absorption, and edge darkening while the camera is under a liquid. Requires \r_fbo 1 and vid_restart." );
+	ri.Cvar_SetGroup( r_underwater, CVG_RENDERER );
+	r_underwaterWarp = ri.Cvar_Get( "r_underwaterWarp", "1.0", CVAR_ARCHIVE_ND );
+	ri.Cvar_CheckRange( r_underwaterWarp, "0", "2", CV_FLOAT );
+	ri.Cvar_SetDescription( r_underwaterWarp, "Submerged screen-warp amplitude. 1.0 is about 11 pixels at 1080 lines, scaled to the view height; 0 disables the warp and its samples." );
+	ri.Cvar_SetGroup( r_underwaterWarp, CVG_RENDERER );
+	r_underwaterDispersion = ri.Cvar_Get( "r_underwaterDispersion", "0.35", CVAR_ARCHIVE_ND );
+	ri.Cvar_CheckRange( r_underwaterDispersion, "0", "1", CV_FLOAT );
+	ri.Cvar_SetDescription( r_underwaterDispersion, "Submerged chromatic dispersion, as a fraction of the warp displacement split across the color channels. 0 keeps all three channels aligned." );
+	ri.Cvar_SetGroup( r_underwaterDispersion, CVG_RENDERER );
+	r_underwaterFog = ri.Cvar_Get( "r_underwaterFog", "1.0", CVAR_ARCHIVE_ND );
+	ri.Cvar_CheckRange( r_underwaterFog, "0", "1", CV_FLOAT );
+	ri.Cvar_SetDescription( r_underwaterFog, "Submerged distance-absorption strength. The medium color and density follow the liquid type; 0 disables the absorption tint." );
+	ri.Cvar_SetGroup( r_underwaterFog, CVG_RENDERER );
+	r_underwaterVignette = ri.Cvar_Get( "r_underwaterVignette", "0.35", CVAR_ARCHIVE_ND );
+	ri.Cvar_CheckRange( r_underwaterVignette, "0", "1", CV_FLOAT );
+	ri.Cvar_SetDescription( r_underwaterVignette, "Submerged edge darkening. 0 leaves the periphery at full brightness." );
+	ri.Cvar_SetGroup( r_underwaterVignette, CVG_RENDERER );
 	r_celShading = ri.Cvar_Get( "r_celShading", "0", CVAR_ARCHIVE );
 	ri.Cvar_CheckRange( r_celShading, "0", "1", CV_INTEGER );
 	ri.Cvar_SetDescription( r_celShading, "Enable cel shading on model entities, including brush models, player models, and the first-person weapon." );
@@ -3710,6 +3736,7 @@ refexport_t *GetRefAPI ( int apiVersion, refimport_t *rimp ) {
 	re.AddAdditiveLightToScene = RE_AddAdditiveLightToScene;
 	re.AddLinearLightToScene = RE_AddLinearLightToScene;
 	re.AddLiquidInteractionToScene = RE_AddLiquidInteractionToScene;
+	re.SetUnderwaterView = RE_SetUnderwaterView;
 
 	re.RenderScene = RE_RenderScene;
 	re.AdvertisementBridge_UpdateLoadingViewParameters = AdvertisementBridge_UpdateLoadingViewParameters;

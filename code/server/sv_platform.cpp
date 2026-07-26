@@ -14,6 +14,7 @@ version.
 #include "server.h"
 #include "server_cvar_compat.hpp"
 #include "../platform/fnql_steam.h"
+#include "../qcommon/steam_identity.hpp"
 
 #include <array>
 #include <cstring>
@@ -45,8 +46,18 @@ void ApplyRetailDefaultHostname()
 	if ( !FNQL_Steam_GetStatus( &status ) || !status.persona_name[0] ) {
 		return;
 	}
+	// sv_hostname is SERVERINFO, so the persona goes through the same
+	// normalization the client applies to "name". An unnormalized backslash,
+	// quote, or semicolon would drop the whole key out of the serverinfo string
+	// and hide the server from browsers, and a trailing color escape would
+	// swallow the leading character of "'s Match".
+	std::array<char, MAX_NAME_LENGTH> persona{};
+	if ( !fnql::identity::NormalizePersonaName( status.persona_name,
+		persona.data(), persona.size() ).usable ) {
+		return;
+	}
 	char hostname[MAX_CVAR_VALUE_STRING];
-	Com_sprintf( hostname, sizeof( hostname ), "%s's Match", status.persona_name );
+	Com_sprintf( hostname, sizeof( hostname ), "%s's Match", persona.data() );
 	Cvar_Set( sv_hostname->name, hostname );
 }
 

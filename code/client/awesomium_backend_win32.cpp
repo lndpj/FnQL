@@ -279,11 +279,34 @@ public:
 		return BackendResult::Success();
 	}
 
+	// The runtime's second WebKeyboardEvent constructor is the Win32 message
+	// form -- (UINT msg, WPARAM wparam, LPARAM lparam), matching its @12 stdcall
+	// stack size -- and it is the only one the generated C ABI publishes.  It
+	// derives the event type, the typed text, the key identifier, and the live
+	// modifier state from real message parameters, so an event has to be
+	// presented as the message triple Windows itself would deliver.  Passing the
+	// browser-neutral event type where the message id belongs matches no message
+	// case, which leaves the event untyped and drops its text: retail pages
+	// composite normally but their input fields never receive characters.
 	BackendResult InjectKeyboard( const KeyboardEvent &event ) noexcept override {
-		void *keyboard = imports_.newWebKeyboardEvent(
-			static_cast<unsigned int>( event.type ),
-			event.virtualKey,
-			static_cast<long>( event.nativeKey ) );
+		unsigned int message;
+		switch ( event.type ) {
+			case KeyboardEventType::KeyDown:
+				message = WM_KEYDOWN;
+				break;
+			case KeyboardEventType::KeyUp:
+				message = WM_KEYUP;
+				break;
+			case KeyboardEventType::Character:
+				message = WM_CHAR;
+				break;
+			default:
+				return Fail( BackendError::InvalidArgument,
+					"unknown WebUI keyboard event type" );
+		}
+
+		void *keyboard = imports_.newWebKeyboardEvent( message, event.virtualKey,
+			MessageKeyParameter( event ) );
 		if ( !keyboard ) {
 			return Fail( BackendError::ResourceUnavailable,
 				"could not allocate an Awesomium keyboard event" );
@@ -862,6 +885,59 @@ private:
 		const std::size_t separator = directory.find_last_of( L"\\/" );
 		return separator == std::wstring::npos
 			? std::wstring{} : directory.substr( 0, separator );
+	}
+
+	// Windows sets the extended-key bit for the editing cluster, the arrow
+	// cluster, and the right-hand modifiers; several of them share a scancode
+	// with a keypad key and are only told apart by that bit.
+	static bool IsExtendedVirtualKey( unsigned int virtualKey ) noexcept {
+		switch ( virtualKey ) {
+			case VK_INSERT:
+			case VK_DELETE:
+			case VK_HOME:
+			case VK_END:
+			case VK_PRIOR:
+			case VK_NEXT:
+			case VK_LEFT:
+			case VK_RIGHT:
+			case VK_UP:
+			case VK_DOWN:
+			case VK_NUMLOCK:
+			case VK_DIVIDE:
+			case VK_SNAPSHOT:
+			case VK_RCONTROL:
+			case VK_RMENU:
+			case VK_LWIN:
+			case VK_RWIN:
+			case VK_APPS:
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	// Rebuild the lParam Windows would have sent: repeat count 1, the layout's
+	// scancode, the extended bit, and -- for a release -- the previous-state and
+	// transition bits a real WM_KEYUP always carries.  A caller that observed a
+	// specific hardware key keeps its own value.
+	static long MessageKeyParameter( const KeyboardEvent &event ) noexcept {
+		if ( event.nativeKey != 0 ) {
+			return static_cast<long>( event.nativeKey );
+		}
+		if ( event.type == KeyboardEventType::Character ) {
+			return 1;
+		}
+
+		unsigned long parameter = 1;
+		const UINT scanCode = MapVirtualKeyW( event.virtualKey, MAPVK_VK_TO_VSC );
+		parameter |= ( static_cast<unsigned long>( scanCode ) & 0xffu ) << 16;
+		if ( IsExtendedVirtualKey( event.virtualKey ) ) {
+			parameter |= 1ul << 24;
+		}
+		if ( event.type == KeyboardEventType::KeyUp ) {
+			parameter |= 3ul << 30;
+		}
+		return static_cast<long>( parameter );
 	}
 
 	static std::wstring ToWide( std::string_view text ) {

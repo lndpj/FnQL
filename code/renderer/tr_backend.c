@@ -4059,6 +4059,11 @@ static const void *RB_DrawSurfs( const void *data ) {
 	/* Apply the optional sidecar after scene and native BSP fog work, but before
 	 * motion blur, bloom/gamma, and later HUD/console scenes. */
 	FBO_DrawGlobalFog();
+
+	/* The submerged view is a property of the eye's medium, so it composites
+	 * over the finished scene and its fog, and still ahead of motion blur,
+	 * bloom, gamma, and later HUD/console scenes. */
+	FBO_DrawUnderwater();
 #endif
 
 	//TODO Maybe check for rdf_noworld stuff but q3mme has full 3d ui

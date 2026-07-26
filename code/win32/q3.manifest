@@ -14,7 +14,13 @@
 	</trustInfo>
 	<application xmlns="urn:schemas-microsoft-com:asm.v3">
 		<windowsSettings>
+			<!-- Per-Monitor V2 is the awareness level SDL3 requests for itself and the
+			     one its window/frame math assumes. Declaring it here also covers the
+			     system console, which exists before SDL video is initialized, and it
+			     scales the non-client frame with the monitor the window sits on.
+			     dpiAware is the fallback for releases predating the 2016 element. -->
 			<dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">True/PM</dpiAware>
+			<dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
 		</windowsSettings>
 	</application>
 </assembly>

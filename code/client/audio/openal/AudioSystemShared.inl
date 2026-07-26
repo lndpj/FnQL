@@ -5,6 +5,7 @@ namespace azfmt = fnql_audiozones;
 namespace azrt = fnql_audiozones_runtime;
 namespace adr = fnql_audio_device_recovery;
 namespace occ = fnql_audio_occlusion;
+namespace tone = fnql_audio_tone;
 
 constexpr int kMaxVoices = MAX_CHANNELS;
 constexpr size_t kMaxRegisteredSamples = 4096;
@@ -38,16 +39,6 @@ constexpr float kOcclusionTargetRiseHysteresis = 0.04f;
 constexpr float kOcclusionTargetFallHysteresis = 0.10f;
 constexpr float kOcclusionAttackPerSecond = 5.5f;
 constexpr float kOcclusionReleasePerSecond = 2.25f;
-constexpr float kToneNeutralThreshold = 0.985f;
-constexpr float kToneStrongOcclusionThreshold = 0.68f;
-constexpr float kToneStrongOcclusionLowCut = 0.26f;
-constexpr float kToneUnderwaterLowCut = 0.30f;
-constexpr float kToneUnderwaterHighCut = 0.18f;
-constexpr float kToneAnnouncerLowCut = 0.10f;
-constexpr float kToneLocalLowCut = 0.08f;
-constexpr float kToneItemLowCut = 0.06f;
-constexpr float kToneVoiceLowCut = 0.08f;
-constexpr float kToneBodyHighCut = 0.06f;
 constexpr float kPanScale = 2.0f;
 constexpr float kMetersPerGameUnit = 0.0254f;
 constexpr float kListenerVelocityMax = 1500.0f;
@@ -498,16 +489,16 @@ static bool FilterHasAudibleEffect( const AudioFilterSettings &filter ) {
 	if ( filter.kind == AudioFilterKind::None ) {
 		return false;
 	}
-	if ( filter.gain < kToneNeutralThreshold ) {
+	if ( filter.gain < tone::kToneNeutralThreshold ) {
 		return true;
 	}
 	if ( filter.kind == AudioFilterKind::HighPass || filter.kind == AudioFilterKind::BandPass ) {
-		if ( filter.gainLF < kToneNeutralThreshold ) {
+		if ( filter.gainLF < tone::kToneNeutralThreshold ) {
 			return true;
 		}
 	}
 	if ( filter.kind == AudioFilterKind::LowPass || filter.kind == AudioFilterKind::BandPass ) {
-		if ( filter.gainHF < kToneNeutralThreshold ) {
+		if ( filter.gainHF < tone::kToneNeutralThreshold ) {
 			return true;
 		}
 	}
@@ -1416,6 +1407,49 @@ static bool OcclusionEnabled() {
 	return s_alOcclusion == nullptr || s_alOcclusion->integer != 0;
 }
 
+static bool PointInOccludingSolid( const float *origin ) {
+	if ( origin == nullptr || !CollisionWorldReady() ) {
+		return false;
+	}
+	return ( CM_PointContents( origin, 0 ) & kOcclusionMask ) != 0;
+}
+
+// Weapon impacts and explosions are emitted flush against the surface they hit,
+// so the raw event origin sits on -- and after the origin snap sometimes just
+// inside -- world geometry. Tracing to that point reports the surface the sound
+// is resting on as an obstruction. Sample from just clear of it instead, and
+// only fall back to the raw origin when the source really is embedded in
+// geometry rather than touching it.
+static void ResolveOcclusionSamplePoint( const float *sourceOrigin, const vec3_t toSource, vec3_t sample ) {
+	VectorMA( sourceOrigin, -occ::kSurfaceBias, toSource, sample );
+	if ( !PointInOccludingSolid( sample ) ) {
+		return;
+	}
+
+	VectorMA( sourceOrigin, -occ::kSurfaceEscape, toSource, sample );
+	if ( !PointInOccludingSolid( sample ) ) {
+		return;
+	}
+
+	VectorCopy( sourceOrigin, sample );
+}
+
+// A probe that lands inside world geometry says nothing about whether the
+// direct path is obstructed: part of the fan is always buried in the surface an
+// impact sound rests against. Drop those samples instead of counting them as
+// obstructions, so a floor or corner detonation is not muffled by its own
+// impact surface.
+static void AddOcclusionProbe( const float *listenerOrigin, const float *probeOrigin, int &blocked, int &total ) {
+	if ( PointInOccludingSolid( probeOrigin ) ) {
+		return;
+	}
+
+	++total;
+	if ( TraceBlocked( listenerOrigin, probeOrigin ) ) {
+		++blocked;
+	}
+}
+
 static float MoveFloatTowards( float current, float target, float maxDelta ) {
 	if ( current < target ) {
 		return ( std::min )( current + maxDelta, target );
@@ -1465,7 +1499,10 @@ static float ComputeOcclusionFactor( const float *listenerOrigin, const float *s
 		vertical[2] = 1.0f;
 	}
 
-	const bool centerBlocked = TraceBlocked( listenerOrigin, sourceOrigin ) != qfalse;
+	vec3_t samplePoint;
+	ResolveOcclusionSamplePoint( sourceOrigin, toSource, samplePoint );
+
+	const bool centerBlocked = TraceBlocked( listenerOrigin, samplePoint ) != qfalse;
 	int blocked = centerBlocked ? 1 : 0;
 	int total = 1;
 
@@ -1473,15 +1510,14 @@ static float ComputeOcclusionFactor( const float *listenerOrigin, const float *s
 		const float spread = occ::ProbeSpreadForDistance( distance );
 		vec3_t shifted;
 
-		VectorMA( sourceOrigin, spread, right, shifted );
-		blocked += TraceBlocked( listenerOrigin, shifted ) ? 1 : 0;
-		VectorMA( sourceOrigin, -spread, right, shifted );
-		blocked += TraceBlocked( listenerOrigin, shifted ) ? 1 : 0;
-		VectorMA( sourceOrigin, spread, vertical, shifted );
-		blocked += TraceBlocked( listenerOrigin, shifted ) ? 1 : 0;
-		VectorMA( sourceOrigin, -spread, vertical, shifted );
-		blocked += TraceBlocked( listenerOrigin, shifted ) ? 1 : 0;
-		total = 5;
+		VectorMA( samplePoint, spread, right, shifted );
+		AddOcclusionProbe( listenerOrigin, shifted, blocked, total );
+		VectorMA( samplePoint, -spread, right, shifted );
+		AddOcclusionProbe( listenerOrigin, shifted, blocked, total );
+		VectorMA( samplePoint, spread, vertical, shifted );
+		AddOcclusionProbe( listenerOrigin, shifted, blocked, total );
+		VectorMA( samplePoint, -spread, vertical, shifted );
+		AddOcclusionProbe( listenerOrigin, shifted, blocked, total );
 	}
 
 	const float strength = ( s_alOcclusionStrength != nullptr ) ? s_alOcclusionStrength->value : 1.0f;

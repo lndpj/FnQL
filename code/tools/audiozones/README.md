@@ -114,11 +114,52 @@ textures/custom/canopy sky preset outdoors flag outdoor
 textures/custom/slosh liquid preset underwater flag underwater weight 12
 ```
 
-BSP generation now weights material votes by shader reference type: visible draw
-surfaces count more than brush bodies, and brush sides count as supporting
-evidence. When generated zones are coarsened to meet `--max-zones`, the dominant
-material metadata is recomputed from accumulated material weights instead of
-keeping whichever leaf happened to merge first.
+## How BSP generation works
+
+Generation starts from one candidate zone per non-opaque BSP leaf, clipped to the
+world model bounds, and then merges leaves back into room-scale volumes.
+
+Merging is driven by a region adjacency graph rather than by comparing bounding
+boxes. Two leaves are connected when their boxes actually touch, and the graph
+records the accumulated open contact area between them. This is what separates
+"one room a BSP plane happened to cut in half" from "two rooms sharing a wall
+with a door in it": the two cases look identical as bounding boxes, but the BSP
+cut shares a full cross-section while the door shares a fraction of it. A merge
+also has to keep the combined box a tight fit, both against the two boxes going
+into it and against the leaf volume it actually contains — the second test is
+what stops a long chain of individually cheap merges from growing one zone to the
+size of the map.
+
+A quality schedule of progressively looser passes always runs, because BSP leaves
+are fragments of rooms and the environment preset is only meaningful once a zone
+has room-scale bounds. A coarsen schedule runs after it, and only while the zone
+count is still above `--max-zones`.
+
+Classification then follows from the merged volume:
+
+- The environment preset comes from size and shape. The acoustic material only
+  chooses between `room` and `stone-room` for a room-sized volume; it does not
+  override the size test.
+- Material votes are weighted by shader reference type — visible draw surfaces
+  outrank brush bodies, and brush sides count only as weak supporting evidence,
+  since a single leaf routinely references several times more brush sides than
+  draw surfaces.
+- `outdoor` comes from the share of a zone's draw-surface evidence that is sky.
+  Very large volumes need proportionally less of it, so the void of a space map
+  reads as open air rather than as a reverberant hall.
+- `underwater` requires the volume to be inside a liquid brush, tested against
+  the brush planes. Leaf brush lists also name brushes that merely touch the
+  leaf, so a containment test is what keeps a dry room beside a pool out of the
+  underwater preset.
+- Generated priorities are assigned by ascending zone volume, so the tightest
+  zone containing the listener always wins and no two generated zones ever tie.
+
+Portal hints come from the same adjacency graph, so a hint exists only where two
+zones are genuinely connected, its quad covers the real opening, and its
+`openness` is the share of the smaller zone's face that is actually open. Blend
+tuning is derived from that geometry: `blendDistance` scales with the size of the
+opening, `maxBlend` scales with openness, and the curve is `ease-out` for wide
+openings, `ease-in` for narrow ones, and `smooth` in between.
 
 Use `--audit` on generated sidecars before listening passes. It runs the same
 runtime parser used by the client, prints preset/material/flag/portal coverage,
@@ -129,6 +170,14 @@ confidence, an anomaly score, and a grade so generated maps can be triaged befor
 listening. `--samples N` controls the profile grid size; `--strict` returns a
 non-zero exit code when warnings are emitted, which is useful for CI experiments
 or large-map sweeps.
+
+The `scale` line reports zone size relative to the sidecar bounds and counts
+zones that cover more than half of the map. Lookup confidence is the share of
+resolved samples that land in a zone of sane scale rather than in a map-sized
+box, because raw coverage rewards the wrong thing — a single zone spanning the
+whole level scores 100% coverage. A map whose largest zone spans most of the
+bounds is worth inspecting, though it is legitimate for space maps and other
+single-volume arenas, where the open void really is one enormous space.
 
 ## Bulk migration sweeps
 
@@ -162,7 +211,7 @@ FnQL ships generated `.azb` sidecars for the standard Quake III Arena
 `pkg/baseq3/maps/`, and release/install builds pack them into
 `FnQL-pkg.fnz` under `baseq3/maps/` archive paths. The same package source
 tree also carries other data-only OpenAL tuning files, such as the standard
-weapon sound shaders under `pkg/baseq3/sound/` and `pkg/missionpack/sound/`.
+weapon sound shader under `pkg/baseq3/sound/`.
 Regenerate the sidecars from a local retail `baseq3` install with:
 
 ```powershell

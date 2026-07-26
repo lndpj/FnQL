@@ -129,6 +129,8 @@ static int cl_liquidEmissionCount;
 static int cl_liquidFeedCheckFrame = INT_MIN;
 static qboolean cl_liquidFeedEnabled;
 static qboolean cl_liquidFeedWasEnabled;
+static int cl_underwaterFeedCheckFrame = INT_MIN;
+static qboolean cl_underwaterFeedEnabled;
 
 
 static qboolean CL_CaptureHidesHud( void ) {
@@ -508,6 +510,59 @@ static void CL_UpdateLocalViewLiquidInteraction( const refdef_t *refdef ) {
 
 	CL_UpdateLiquidMotionTrack( &cl_liquidViewTrack, LIQUID_INTERACTION_PLAYER,
 		refdef->vieworg, refdef->time, 0 );
+}
+
+
+static qboolean CL_UnderwaterViewFeedEnabled( void ) {
+	// One check per submitted scene rather than one per frame is already cheap,
+	// but the cache keeps this consistent with the liquid feed above and still
+	// notices a cvar change on the next rendered frame.
+	if ( cl_underwaterFeedCheckFrame != cls.framecount ) {
+		cl_underwaterFeedCheckFrame = cls.framecount;
+		cl_underwaterFeedEnabled = ( re.SetUnderwaterView &&
+			Cvar_VariableIntegerValue( "r_underwater" ) > 0 ) ? qtrue : qfalse;
+	}
+	return cl_underwaterFeedEnabled;
+}
+
+
+/*
+====================
+CL_UpdateUnderwaterView
+
+Samples the liquid contents at the camera and hands the result to the renderer
+as a visual-only record. The engine owns this query because the renderer has no
+collision model, and the renderer owns the entry/exit ramp because only it knows
+which submitted views are real world views.
+
+Nothing here reaches prediction, snapshots, protocol data, or demo data: a demo
+replays the same camera path and therefore reproduces the same medium, but the
+sample itself is never recorded or transmitted.
+====================
+*/
+static void CL_UpdateUnderwaterView( const refdef_t *refdef ) {
+	underwaterView_t view;
+
+	if ( !CL_UnderwaterViewFeedEnabled() ) {
+		return;
+	}
+	// Cgame submits separate RDF_NOWORLDMODEL scenes for 3D HUD models. Those
+	// carry an unrelated camera and must not disturb the world view's medium.
+	if ( !refdef || ( refdef->rdflags & RDF_NOWORLDMODEL ) ) {
+		return;
+	}
+	// The hyperspace flash replaces the view entirely; leave the last sample in
+	// place instead of reporting a dry camera for those frames.
+	if ( refdef->rdflags & RDF_HYPERSPACE ) {
+		return;
+	}
+	if ( !CL_LiquidOriginValid( refdef->vieworg ) ) {
+		return;
+	}
+
+	view.contents = CM_PointContents( refdef->vieworg, 0 ) & MASK_WATER;
+	view.time = refdef->time;
+	re.SetUnderwaterView( &view );
 }
 
 //extern qboolean loadCamera(const char *name);
@@ -1758,6 +1813,7 @@ static intptr_t CL_CgameSystemCalls( intptr_t *args ) {
 		}
 
 		CL_UpdateLocalViewLiquidInteraction( refdef );
+		CL_UpdateUnderwaterView( refdef );
 		CL_FlushEnemyHighlightRefEntities( refdef );
 		re.RenderScene( refdef );
 		return 0;

@@ -230,6 +230,149 @@ class LiquidRenderingSourceTests(unittest.TestCase):
         resume = self.vk_impl.index("vk_begin_main_render_pass_load();", capture)
         self.assertNotIn("VK_DEPENDENCY_BY_REGION_BIT", self.vk_impl[capture:resume])
 
+    def test_depth_rejection_does_not_depend_on_the_soft_particle_cvar(self) -> None:
+        # The waterline rejection needs the copied opaque depth whenever
+        # enhanced liquids are on. The OpenGL-lineage backend copies it
+        # regardless of r_depthFade; Vulkan must request the same copy target
+        # or the rejection silently disappears with r_depthFade 0.
+        self.assertIn("void FBO_CopyLiquidDepth( void )", self.gl_arb)
+        gl_copy = self.gl_arb.index("void FBO_CopyLiquidDepth( void )")
+        gl_copy_body = self.gl_arb[gl_copy:self.gl_arb.index("}", gl_copy)]
+        self.assertNotIn("r_depthFade", gl_copy_body)
+
+        vk_requested = self.vk_impl.index(
+            "static qboolean vk_depth_fade_requested( void )\n{")
+        vk_requested_body = self.vk_impl[
+            vk_requested:self.vk_impl.index("}", vk_requested)
+        ]
+        self.assertIn("r_liquid", vk_requested_body)
+
+    def test_ripple_ring_shape_is_shared_by_every_backend(self) -> None:
+        # The ring expands and its band widens with the *current* radius. The
+        # per-vertex fallback used to keep the impulse's original width, which
+        # made the legacy tier draw a thin ring where the shaders draw a broad
+        # one.
+        for constant in ("LIQUID_RIPPLE_EXPAND_SPEED 150.0f",
+                         "LIQUID_RIPPLE_WIDTH_BASE 20.0f",
+                         "LIQUID_RIPPLE_WIDTH_SCALE 0.12f"):
+            self.assertIn(constant, self.liquid_header)
+        for source in (self.gl, self.vk):
+            self.assertIn("LIQUID_RIPPLE_EXPAND_SPEED", source)
+        self.assertIn("LIQUID_RIPPLE_WIDTH_BASE", self.gl)
+        self.assertIn("LIQUID_RIPPLE_WIDTH_SCALE", self.gl)
+        self.assertNotIn("interaction->radius * 0.35f", self.gl)
+        # ...and the shader copies keep the same two numbers inline.
+        self.assertIn("width = 20.0 + impulse.w * 0.12", self.gl_liquid_shader)
+        self.assertIn("width = 20.0 + radius * 0.12", self.vk_shader)
+
+    def test_reflection_and_warp_constants_are_shared_across_backends(self) -> None:
+        # Every number in the shared per-fragment model has one authority in
+        # renderercommon/tr_liquid.h. The two GLSL copies inline the same
+        # literals; a silent edit on one backend must fail here.
+        constants = (
+            ("LIQUID_WARP_DISTANCE_REF", "320.0"),
+            ("LIQUID_WARP_DISTANCE_MIN_ATTEN", "0.30"),
+            ("LIQUID_GRAZING_FADE_SCALE", "4.0"),
+            ("LIQUID_DEPTH_REJECT_EPSILON", "0.00003"),
+            ("LIQUID_REFLECT_PROXY_BASE", "384.0"),
+            ("LIQUID_REFLECT_PROXY_VIEW", "0.75"),
+            ("LIQUID_FRESNEL_ALPHA_BASE", "0.04"),
+            ("LIQUID_FRESNEL_ALPHA_SPAN", "0.56"),
+            ("LIQUID_FRESNEL_ALPHA_MAX", "0.60"),
+            ("LIQUID_NORMAL_PERTURB", "0.12"),
+            ("LIQUID_TANGENT_AXIS_EPSILON", "0.9"),
+        )
+        for name, literal in constants:
+            self.assertIn("#define %s %sf" % (name, literal), self.liquid_header)
+            self.assertIn(literal, self.gl_liquid_shader)
+            self.assertIn(literal, self.vk_shader)
+        # The reflection weight itself is uploaded from the shared constant
+        # rather than inlined, so both backends collapse to the flat sheen
+        # identically when the snapshot is missing.
+        self.assertIn("#define LIQUID_REFLECT_INTENSITY 0.85f", self.liquid_header)
+        # The per-vertex fallback shares the Fresnel curve with the shaders.
+        self.assertIn("LIQUID_FRESNEL_ALPHA_MAX", self.gl)
+
+    def test_fresnel_uses_the_schlick_fifth_power_on_every_tier(self) -> None:
+        # A squared falloff spreads reflection across every viewing angle and
+        # reads as a uniform milky sheen. Schlick's fifth power keeps the
+        # surface clear looking down and climbs sharply toward grazing.
+        self.assertIn("#define LIQUID_FRESNEL_POWER 5", self.liquid_header)
+        self.assertIn("return f2 * f2 * f;", self.liquid_header)
+        # The per-vertex fallback shares the helper instead of squaring inline.
+        self.assertIn("R_LiquidFresnel( DotProduct( waveNormal, view ) )", self.gl)
+        self.assertNotIn("fresnel *= fresnel;", self.gl)
+        # Both GLSL copies expand the same fifth power.
+        self.assertIn("fresnel2 = fresnel * fresnel", self.gl_liquid_shader)
+        self.assertIn("fresnel = fresnel2 * fresnel2 * fresnel", self.gl_liquid_shader)
+        self.assertIn("fresnel2 = fresnel * fresnel", self.vk_shader)
+        self.assertIn("fresnel = fresnel2 * fresnel2 * fresnel", self.vk_shader)
+        self.assertNotIn("fresnel *= fresnel;", self.vk_shader)
+        # ...and the ARB sheen program chains three multiplies for f^5.
+        sheen_start = self.gl_arb.index("liquidSheenFP")
+        sheen = self.gl_arb[sheen_start:self.gl_arb.index('"END', sheen_start)]
+        self.assertIn("MUL s.z, s.y, s.y;", sheen)
+        self.assertIn("MUL s.z, s.z, s.z;", sheen)
+        self.assertIn("MUL s.z, s.z, s.y;", sheen)
+
+    def test_wave_normal_is_perturbed_inside_the_tangent_plane(self) -> None:
+        # Adding the gradient to model-space XY pushes part of it along the
+        # normal on slanted or vertical liquid faces, where it rescales the
+        # vector instead of tilting it. Every tier builds a tangent frame whose
+        # reference axis makes a horizontal face reduce to ( gx, gy, 0 ).
+        self.assertIn("R_LiquidTangentFrame", self.liquid_header)
+        # The per-vertex fallback shares the helper rather than reimplementing
+        # (or skipping) the perturbation.
+        self.assertIn("R_LiquidTangentFrame( normal, tangent, bitangent )", self.gl)
+        for shader in (self.gl_liquid_shader, self.vk_shader):
+            self.assertIn("abs(normal.z) < 0.9", shader)
+            self.assertIn("vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0)", shader)
+            self.assertIn("cross(normal, tangent)", shader)
+        self.assertNotIn("vec3(waveGradient * 0.12, 0.0)", self.gl_liquid_shader)
+        self.assertNotIn("vec3(wave_gradient * 0.12, 0.0)", self.vk_shader)
+        # The ARB tier builds the same reference vector arithmetically, because
+        # an ARB instruction may name only one program parameter.
+        sheen_start = self.gl_arb.index("liquidSheenFP")
+        sheen = self.gl_arb[sheen_start:self.gl_arb.index('"END', sheen_start)]
+        self.assertIn("PARAM frame = { 0.9, 0.0, 1.0, 0.0 };", sheen)
+        self.assertIn("SGE r.y, r.x, frame.x;", sheen)
+        self.assertIn("XPD phase.xyz, r, n;", sheen)
+        self.assertIn("XPD wave.xyz, n, phase;", sheen)
+
+    def test_refraction_underlay_replaces_instead_of_ghosting(self) -> None:
+        # Blending a warped copy of the scene over the unwarped destination is
+        # a two-tap smear, not a refraction. r_liquidRefraction scales the
+        # displacement and the underlay draws at the liquid type's opacity.
+        self.assertIn("float alpha = typeScale;\\n", self.gl_shader)
+        self.assertIn("float alpha = liquid_info.x;", self.vk_shader)
+        for source in (self.gl, self.vk):
+            self.assertIn("refractionScale", source)
+        # Both backends fold the cvar into the warp pixels and the ripple
+        # amplitudes rather than into the underlay alpha.
+        self.assertIn("backEnd.viewParms.viewportHeight ) * refractionScale;", self.gl)
+        self.assertIn("LIQUID_RIPPLE_PIXEL_SCALE * heightScale * refractionScale;", self.gl)
+        self.assertIn("refractionScale;", self.vk)
+        self.assertIn("LIQUID_RIPPLE_PIXEL_SCALE * heightScale * refractionScale;", self.vk)
+        # The sheen pass still scales its alpha by r_liquidReflection.
+        self.assertIn("passAlpha = refractionBase ? typeScale : ( typeScale * passStrength )",
+                      self.gl)
+        self.assertIn("liquid_info.x * clamp(liquid_params.z, 0.0, 1.0)", self.vk_shader)
+        self.assertIn("typeScale * clamp(u_Params.z, 0.0, 1.0)", self.gl_shader)
+
+    def test_shaders_guard_degenerate_normals_and_view_vectors(self) -> None:
+        # A zero-length normal or an eye exactly on the surface would make
+        # normalize() produce NaN and blow out the whole fragment.
+        self.assertIn("normalLength > 0.000001 ? v_Normal / normalLength",
+                      self.gl_liquid_shader)
+        self.assertIn("viewLength > 0.000001 ? viewVector / viewLength",
+                      self.gl_liquid_shader)
+        self.assertIn("normal_length > 0.000001 ? frag_normal / normal_length",
+                      self.vk_shader)
+        self.assertIn("view_length > 0.000001 ? frag_view / view_length",
+                      self.vk_shader)
+        self.assertNotIn("normalize(frag_normal)", self.vk_shader)
+        self.assertNotIn("normalize(frag_view)", self.vk_shader)
+
     def test_liquid_passes_preserve_destination_alpha(self) -> None:
         self.assertIn("GL_ColorMask( previousColorMask[0]", self.gl)
         self.assertIn("def->shader_type == TYPE_LIQUID", self.vk_impl)

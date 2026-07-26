@@ -63,6 +63,7 @@ engine owner.
 | Networking | Retail timeout, packet, delta, resend, and diagnostic controls keep their recovered defaults/bounds while retaining compatible FnQL persistence metadata. |
 | Download UI | Retail name/item/time publications and the retained byte counters have stable, inert defaults and continue to be updated by existing download paths. |
 | Input | Retail yaw, pitch, run, freelook, mouse-acceleration, sensitivity-cap, and debug controls retain their owners and runtime wiring. |
+| Player identity | `name` keeps the retail `UnnamedPlayer` default and is published from the signed-in Steam persona, with `country` registered beside it from the same identity and routed to the replicated config as retail does. Local writes are reverted before userinfo is sent, matching a retail UI that has no rename control and a retail engine that never persists a name. FnQL keeps `name` archived anyway so provider-free sessions retain one; `cl_steamNameLock 0` returns `name` to local management. See [STEAM_PROVIDER.md](STEAM_PROVIDER.md). |
 
 FnQL-only controls such as `cl_autoNudge`, `cl_aviFrameRate`,
 `cl_allowDownload`, `cl_mouseAccelStyle`, and `cl_renderer` are deliberate

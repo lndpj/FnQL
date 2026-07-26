@@ -252,6 +252,9 @@
     <ClInclude Include="..\..\client\audio\shared\AudioOcclusion.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="..\..\client\audio\shared\AudioTonePolicy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="..\..\client\audio\shared\AudioZoneFormat.h">
       <Filter>Header Files</Filter>
     </ClInclude>

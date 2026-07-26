@@ -28,7 +28,16 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 //
 
 // surface geometry should not exceed these limits
-#define	SHADER_MAX_VERTEXES	1000
+//
+// Retail Quake Live doubled Quake III's 1000-vertex surface budget: QLSRP
+// qcommon/qfiles.h and bspc/q3files.h both carry SHADER_MAX_VERTEXES 2000, and
+// retail ships MD3s that need it (models/weapons3/hmg/hmg.md3 has a 1053-vertex
+// surface).  Retail also accepts a surface sitting exactly on the cap, since its
+// R_LoadMD3 rejects on `>`.  FnQL inherits Quake3e's stricter tessellator
+// predicates - RB_CheckOverflow flushes when a batch would *reach* the array
+// size and R_LoadMD3 rejects on `>=` - so the arrays carry one spare slot past
+// the retail cap rather than losing the boundary case to an off-by-one.
+#define	SHADER_MAX_VERTEXES	2001	// retail cap 2000, +1 for the flush predicate
 #define	SHADER_MAX_INDEXES	(6*SHADER_MAX_VERTEXES)
 
 

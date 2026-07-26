@@ -70,11 +70,25 @@ class JoinMenuSourceTests(unittest.TestCase):
         self.assertIn("KEYCATCH_CGAME | KEYCATCH_BROWSER", body)
         self.assertIn("| KEYCATCH_UI", body)
 
+    def test_native_ui_menu_claim_is_not_gated_on_the_ui_menu_stack_query(self) -> None:
+        # UI_MENUS_ANY_VISIBLE is a recovered retail slot that is only
+        # established for the fullscreen main menu.  Gating KEYCATCH_UI on it
+        # here withholds the in-game menu's draw pass, absolute-pointer cursor,
+        # and mouse grab, which all key off that catcher bit.
+        body = function_body(read_source(), "CL_ActivateNativeMenu")
+
+        self.assertNotIn("CL_UIMenusAreVisible", body)
+        self.assertIn(
+            "Key_SetCatcher( ( Key_GetCatcher() & ~( KEYCATCH_CGAME | KEYCATCH_BROWSER ) )\n"
+            "\t\t| KEYCATCH_UI );",
+            body,
+        )
+
     def test_menu_toggle_uses_the_join_menu_for_spectators_only(self) -> None:
         body = function_body(read_source(), "CL_ToggleMenuInternal")
 
         self.assertIn("const qboolean openJoinMenu = CL_ShouldOpenJoinMenu();", body)
-        self.assertIn("if ( cls.state != CA_ACTIVE || clc.demoplaying )", body)
+        self.assertIn("( cls.state != CA_ACTIVE || clc.demoplaying )", body)
         self.assertIn("CL_WebHost_HideForGameTransition();", body)
         self.assertNotIn("CG_EVENT_HANDLING, CGAME_EVENT_TEAMMENU", body)
         self.assertIn("if ( !openJoinMenu )", body)
@@ -82,6 +96,28 @@ class JoinMenuSourceTests(unittest.TestCase):
             "CL_ActivateNativeMenu( openJoinMenu ? UIMENU_TEAM : UIMENU_INGAME );",
             body,
         )
+
+    def test_menu_toggle_does_not_query_the_ui_menu_stack(self) -> None:
+        body = function_body(read_source(), "CL_ToggleMenuInternal")
+
+        self.assertNotIn("CL_UIMenusAreVisible", body)
+
+    def test_browser_keeps_escape_only_while_it_can_present_a_surface(self) -> None:
+        body = function_body(read_source(), "CL_ToggleMenuInternal")
+
+        # A browser input claim that outlived its drawable surface can neither
+        # show a menu nor act on Escape, so it must not swallow the key.
+        self.assertIn(
+            "if ( CL_WebHost_HasDrawableSurface()\n"
+            "\t\t\t&& ( cls.state != CA_ACTIVE || clc.demoplaying ) ) {",
+            body,
+        )
+
+    def test_menu_toggle_records_its_entry_state_for_developers(self) -> None:
+        body = function_body(read_source(), "CL_ToggleMenuInternal")
+
+        self.assertIn("Com_DPrintf( \"CL_ToggleMenuInternal: catcher", body)
+        self.assertIn("Key_GetCatcher(), (int)cls.state, (int)openJoinMenu );", body)
 
     def test_join_menu_uses_a_visible_polled_system_cursor(self) -> None:
         sdl_input = read_sdl_input()

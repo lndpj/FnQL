@@ -157,6 +157,20 @@ typedef struct {
 } liquidInteraction_t;
 
 
+/*
+ * Visual-only submerged-view sample supplied by the engine to the renderer.
+ * The engine owns the collision query because the renderer has no collision
+ * model; the renderer owns the transition ramp because only it knows which
+ * views are real world views.  Like the liquid disturbance record above, this
+ * stays outside entityState/playerState and the VM trap ABI, so it cannot
+ * affect prediction, snapshots, protocols, or demo playback.
+ */
+typedef struct {
+	int		contents;	// liquid contents at the eye, zero when dry
+	int		time;		// scene time of the sample, milliseconds
+} underwaterView_t;
+
+
 typedef enum {
 	STEREO_CENTER,
 	STEREO_LEFT,

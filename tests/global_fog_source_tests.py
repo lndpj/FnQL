@@ -142,7 +142,10 @@ class GlobalFogSourceTests(unittest.TestCase):
         self.assertIn("global_fog_frag_spv", shader_data)
         self.assertIn("SHADER_MODULE_OPTIONAL( global_fog_frag_spv", vk)
         self.assertIn("optional = qtrue;", vk)
-        self.assertIn("Vulkan optional global fog pipeline failed", vk)
+        # The failure warning names the pipeline, because more than one optional
+        # feature now takes this path.
+        self.assertIn("WARNING: Vulkan optional %s failed (%s); feature disabled", vk)
+        self.assertIn('pipeline_name = "global fog overlay pipeline";', vk)
         self.assertIn("vk.global_fog_pipeline == VK_NULL_HANDLE", vk)
         self.assertIn("float constants[12];", vk)
         self.assertIn("sizeof( constants )", vk)
@@ -155,6 +158,37 @@ class GlobalFogSourceTests(unittest.TestCase):
         self.assertLess(debug, copy)
         self.assertLess(copy, fog)
         self.assertLess(fog, motion)
+
+    def test_compositor_removes_the_output_overbright_scale(self) -> None:
+        parser = read("code/renderercommon/tr_global_fog.h")
+
+        self.assertIn("R_GlobalFogSceneColor", parser)
+        self.assertIn("R_GlobalFogSrgbToLinear", parser)
+        self.assertIn("scale = ( outputScale > 0.0f ) ? 1.0f / outputScale : 1.0f;", parser)
+
+        arb = read("code/renderer/tr_arb.c")
+        self.assertIn("R_GlobalFogSceneColor( fog, outputScale, sceneLinear, sceneColor );", arb)
+        self.assertIn("outputScale = (float)( 1 << tr.overbrightBits );", arb)
+        self.assertIn("outputScale *= FBO_TonemapExposure();", arb)
+        self.assertIn(
+            "qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 0,\n"
+            "\t\tsceneColor[0], sceneColor[1], sceneColor[2], opacity );",
+            arb,
+        )
+        self.assertNotIn(
+            "qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 0,\n"
+            "\t\tfog->color[0], fog->color[1], fog->color[2], opacity );",
+            arb,
+        )
+
+        for renderer in ("renderervk", "rendererrtx"):
+            vk = read(f"code/{renderer}/vk.c")
+            draw_start = vk.index("void vk_draw_global_fog( void )")
+            draw = vk[draw_start:draw_start + 4000]
+            self.assertIn("outputScale = (float)( 1 << tr.overbrightBits );", draw)
+            self.assertIn("R_GlobalFogSceneColor( fog, outputScale, sceneLinear, sceneColor );", draw)
+            self.assertIn("constants[0] = sceneColor[0];", draw)
+            self.assertNotIn("constants[0] = fog->color[0];", draw)
 
     def test_technical_contract_is_documented(self) -> None:
         technical = read("docs/fnql/TECHNICAL.md")

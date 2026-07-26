@@ -98,7 +98,7 @@ class VidRestartFastSourceTests(unittest.TestCase):
         reuse = source[reuse_start:reuse_end]
 
         # fullscreen direction goes through the shared mode/fallback helper
-        self.assertIn("GLW_ApplyFullscreen( config, display, colorBits )", reuse)
+        self.assertIn("GLW_ApplyFullscreen( config, display )", reuse)
 
         # windowed direction leaves fullscreen and restores borders/geometry
         self.assertIn("SDL_SetWindowFullscreen( SDL_window, false )", reuse)

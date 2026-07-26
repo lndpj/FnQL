@@ -1838,6 +1838,15 @@ static void VK_DrawLiquidPass( const shaderCommands_t *input, qboolean refractio
 	vk_material_t material;
 	const float rippleStrength = r_liquidRipples ? r_liquidRipples->value : 0.0f;
 	const float heightScale = R_LiquidViewHeightScale( glConfig.vidHeight );
+	const float passStrength = refractionBase ?
+		( r_liquidRefraction ? Com_Clamp( 0.0f, 1.0f, r_liquidRefraction->value ) : 1.0f ) :
+		( r_liquidReflection ? Com_Clamp( 0.0f, 1.0f, r_liquidReflection->value ) : 0.0f );
+	/* r_liquidRefraction scales how far the underlay bends the view, not how
+	 * much of the warped copy is mixed with the unwarped destination: mixing
+	 * two different taps produces a two-tap smear instead of a refraction. The
+	 * underlay draws at the liquid type's own opacity and the cvar is folded
+	 * into the displacement here, matching the OpenGL-lineage backend. */
+	const float refractionScale = refractionBase ? passStrength : 1.0f;
 	vec3_t fresnelColor;
 	float liquidMvp[16];
 	int rippleCount = 0;
@@ -1881,11 +1890,10 @@ static void VK_DrawLiquidPass( const shaderCommands_t *input, qboolean refractio
 	/* R_LiquidWarpPixels maps the archived cvar through LIQUID_WARP_TO_PIXELS
 	 * and scales it to the active view height. */
 	slots[0][0] = R_LiquidWaveTime( backEnd.refdef.floatTime );
-	slots[0][1] = r_liquidWarpScale ?
-		R_LiquidWarpPixels( r_liquidWarpScale->value, glConfig.vidHeight ) : 0.0f;
-	slots[0][2] = refractionBase ?
-		( r_liquidRefraction ? Com_Clamp( 0.0f, 1.0f, r_liquidRefraction->value ) : 1.0f ) :
-		( r_liquidReflection ? Com_Clamp( 0.0f, 1.0f, r_liquidReflection->value ) : 0.0f );
+	slots[0][1] = ( r_liquidWarpScale ?
+		R_LiquidWarpPixels( r_liquidWarpScale->value, glConfig.vidHeight ) : 0.0f ) *
+		refractionScale;
+	slots[0][2] = passStrength;
 	slots[0][3] = glConfig.vidWidth > 0 ? 1.0f / (float)glConfig.vidWidth : 1.0f;
 	slots[1][0] = R_LiquidContentsReflectionScale( input->liquidContentFlags );
 	slots[1][2] = glConfig.vidHeight > 0 ? 1.0f / (float)glConfig.vidHeight : 1.0f;
@@ -1906,10 +1914,11 @@ static void VK_DrawLiquidPass( const shaderCommands_t *input, qboolean refractio
 			life = 1.0f - age * ( 1000.0f / (float)LIQUID_IMPULSE_LIFETIME_MSEC );
 			R_LiquidWorldToLocal( interaction->origin, backEnd.or.origin,
 				backEnd.or.axis, slots[2 + rippleCount] );
-			slots[2 + rippleCount][3] = interaction->radius + age * 150.0f;
+			slots[2 + rippleCount][3] = interaction->radius +
+				age * LIQUID_RIPPLE_EXPAND_SPEED;
 			slots[10 + rippleCount / 4][rippleCount & 3] =
 				interaction->strength * rippleStrength * life *
-				LIQUID_RIPPLE_PIXEL_SCALE * heightScale;
+				LIQUID_RIPPLE_PIXEL_SCALE * heightScale * refractionScale;
 			rippleCount++;
 		}
 	}

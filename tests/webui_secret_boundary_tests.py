@@ -27,10 +27,20 @@ class WebUiSecretBoundaryTests(unittest.TestCase):
         ]
         self.assertIn("flags & CVAR_PRIVATE", config_snapshot)
         self.assertGreaterEqual(webui.count("Cvar_Flags( name ) & CVAR_PRIVATE"), 3)
-        self.assertGreaterEqual(
-            webui.count("Cvar_Flags( name ) & ( CVAR_PRIVATE | CVAR_PROTECTED )"),
-            2,
-        )
+
+        # Browser-originated writes are refused for secret cvars and for
+        # read-only engine state. CVAR_PROTECTED is deliberately writable: it
+        # marks Quake Live engine-managed cvars that the retail settings page
+        # owns, and refusing them left those rows present but inert.
+        write_guard = webui[
+            webui.index(
+                "static qboolean CL_WebHost_BrowserMayWriteCvar"
+            ) : webui.index("static void CL_WebHost_ProcessNativeJavascriptRequest")
+        ]
+        self.assertIn("flags & ( CVAR_PRIVATE | CVAR_ROM )", write_guard)
+        self.assertNotIn("CVAR_PROTECTED )", write_guard.split("*/")[-1])
+        self.assertEqual(webui.count("!CL_WebHost_BrowserMayWriteCvar( name )"), 2)
+        self.assertNotIn("Cvar_Flags( name ) & ( CVAR_PRIVATE | CVAR_PROTECTED )", webui)
         browser_publish = webui[
             webui.index("void CL_WebView_PublishCvarChange") : webui.index(
                 "void CL_WebView_PublishBindChanged"

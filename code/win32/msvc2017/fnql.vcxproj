@@ -377,6 +377,7 @@
   <ItemGroup>
     <ClInclude Include="..\..\client\audio\shared\AudioDeviceRecovery.h" />
     <ClInclude Include="..\..\client\audio\shared\AudioOcclusion.h" />
+    <ClInclude Include="..\..\client\audio\shared\AudioTonePolicy.h" />
     <ClInclude Include="..\..\client\audio\shared\AudioZoneFormat.h" />
     <ClInclude Include="..\..\client\audio\shared\AudioZoneRuntime.h" />
     <ClInclude Include="..\..\client\audio\openal\AudioSystemBackend.inl" />

@@ -342,6 +342,54 @@ void NORETURN FORMAT_PRINTF(1, 2) QDECL Sys_Error( const char *format, ... )
 }
 
 
+/*
+==============
+Sys_PromptStartupChoice
+
+Terminal startup notification with the three standard recovery answers.  Engine
+startup runs before Sys_ConsoleInputInit(), so stdin is still line buffered and
+blocking here.  A session without an attached terminal, or one whose tty console
+has already taken over stdin, reports SYS_STARTUP_PROCEED instead of waiting for
+an answer that can never arrive.
+==============
+*/
+sysStartupChoice_t Sys_PromptStartupChoice( const char *title, const char *message )
+{
+	char answer[64];
+
+	if ( !message || !message[0] )
+	{
+		return SYS_STARTUP_PROCEED;
+	}
+
+	if ( ttycon_on || isatty( STDIN_FILENO ) != 1 || isatty( STDOUT_FILENO ) != 1 )
+	{
+		return SYS_STARTUP_PROCEED;
+	}
+
+	fprintf( stdout, "\n%s\n%s\n[c]ontinue, [r]etry or [q]uit? ",
+		title && title[0] ? title : "FnQL", message );
+	fflush( stdout );
+
+	if ( fgets( answer, sizeof( answer ), stdin ) == NULL )
+	{
+		clearerr( stdin );
+		return SYS_STARTUP_PROCEED;
+	}
+
+	switch ( tolower( (unsigned char)answer[0] ) )
+	{
+		case 'r':
+		case 't':
+			return SYS_STARTUP_RETRY;
+		case 'q':
+			return SYS_STARTUP_QUIT;
+		default:
+			return SYS_STARTUP_PROCEED;
+	}
+}
+
+
 void floating_point_exception_handler( int whatever )
 {
 	signal( SIGFPE, floating_point_exception_handler );

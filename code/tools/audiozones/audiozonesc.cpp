@@ -1219,13 +1219,85 @@ constexpr std::size_t kBspHeaderLumps = 17;
 constexpr std::size_t kBspHeaderSize = 8u + kBspHeaderLumps * 8u;
 constexpr std::size_t kBspMaxQpath = 64u;
 constexpr float kMinimumLeafExtent = 4.0f;
-constexpr float kPortalAdjacencyEpsilon = 8.0f;
 constexpr float kPortalMinimumOpenness = 0.04f;
-constexpr float kSplitZoneMergeGapEpsilon = 8.0f;
-constexpr float kSplitZoneMergeOverlapEpsilon = 4.0f;
-constexpr float kSplitZoneMergeMinimumFaceCoverage = 0.55f;
-constexpr float kSplitZoneMergeMaxVolumeInflation = 1.18f;
 constexpr std::uint8_t kGeneratedEnvironmentFlags = azfmt::ZoneFlagOutdoor | azfmt::ZoneFlagUnderwater;
+
+// Shader evidence weights by reference role. Visible draw surfaces are what the
+// listener actually stands in front of, so they outrank brush bodies, and brush
+// sides only count as weak supporting evidence: a single leaf routinely
+// references several times more brush sides than draw surfaces.
+constexpr float kDrawSurfaceRoleWeight = 4.0f;
+constexpr float kBrushBodyRoleWeight = 1.0f;
+constexpr float kBrushSideRoleWeight = 0.25f;
+
+// A brush only contributes liquid contents when it actually contains the leaf.
+// Leaf brush lists also name brushes that merely touch the leaf, which used to
+// drown dry rooms next to water in the underwater preset.
+constexpr float kBrushContainmentEpsilon = 0.25f;
+
+// Fraction of a volume's draw-surface evidence that has to be sky before it is
+// treated as open air, and the relaxed fraction used once a volume is large
+// enough that it cannot be an enclosed room.
+constexpr double kOutdoorSkyFraction = 0.10;
+constexpr double kOpenAirSkyFraction = 0.01;
+constexpr float kOpenAirVolume = 256.0f * 1024.0f * 1024.0f;
+
+// Two leaf boxes are connected when they touch within this distance. Anything
+// further apart has solid geometry between it, so zones never merge across a
+// wall no matter how far the rest of the tuning is relaxed.
+constexpr float kLeafAdjacencyGapEpsilon = 8.0f;
+
+// Merge tuning schedules. The quality schedule always runs: BSP leaves are
+// fragments of rooms, so recovering room-scale volumes is what makes the preset
+// classification meaningful, not just what keeps the zone count down. The
+// coarsen schedule only runs while the zone count is still over the cap.
+//
+// A room a BSP plane cut in half recombines with all three numbers at almost
+// exactly 1.0, because the two halves tile the merged box perfectly. That is why
+// the first pass can afford to be strict, and why every later pass only has to
+// give up a little accuracy at a time.
+//
+// maximumVolumeInflation bounds one merge against the two boxes going into it.
+// maximumFillInflation bounds the merged box against the leaf volume it actually
+// contains, which is what stops a long chain of individually cheap merges from
+// ratcheting a zone up to the size of the map.
+struct MergeTuning {
+	float minimumFaceCoverage;
+	float maximumVolumeInflation;
+	float maximumFillInflation;
+};
+
+constexpr MergeTuning kQualityMergeSchedule[] = {
+	{ 0.90f, 1.02f, 1.06f },
+	{ 0.75f, 1.06f, 1.15f },
+	{ 0.60f, 1.12f, 1.30f },
+	{ 0.48f, 1.18f, 1.45f },
+	{ 0.40f, 1.24f, 1.60f }
+};
+
+constexpr MergeTuning kCoarsenMergeSchedule[] = {
+	{ 0.35f, 1.40f, 2.00f },
+	{ 0.28f, 1.65f, 2.75f },
+	{ 0.20f, 2.00f, 4.00f },
+	{ 0.12f, 2.60f, 6.50f },
+	{ 0.06f, 3.50f, 12.0f }
+};
+
+// Generated priorities are rank based so that overlapping generated zones never
+// tie: the runtime resolves ties by volume anyway, and encoding that ordering in
+// the priority makes every lookup deterministic. Both bands stay negative so
+// hand-authored zones at the default priority 0 still win.
+constexpr std::int32_t kGeneratedLiquidPriorityBase = -600;
+constexpr std::int32_t kGeneratedPriorityBase = -2048;
+
+// Portal blend tuning derived from the opening geometry.
+constexpr float kPortalBlendDistanceScale = 1.5f;
+constexpr float kMinimumGeneratedPortalBlendDistance = 64.0f;
+constexpr float kMaximumGeneratedPortalBlendDistance = 512.0f;
+constexpr float kMinimumGeneratedPortalMaxBlend = 0.15f;
+constexpr float kMaximumGeneratedPortalMaxBlend = 0.55f;
+constexpr float kWidePortalOpenness = 0.75f;
+constexpr float kNarrowPortalOpenness = 0.25f;
 
 enum BspLumpIndex {
 	BspLumpEntities = 0,
@@ -1282,6 +1354,11 @@ struct BspBrushSide {
 	std::int32_t surfaceFlags = 0;
 };
 
+struct BspPlane {
+	Vec3 normal;
+	float distance = 0.0f;
+};
+
 struct BspSurface {
 	std::int32_t shaderNum = -1;
 	std::int32_t surfaceType = 0;
@@ -1298,7 +1375,11 @@ struct MaterialOverrideRule {
 
 struct BspMap {
 	std::int32_t version = 0;
+	Vec3 worldMins;
+	Vec3 worldMaxs;
+	bool haveWorldBounds = false;
 	std::vector<BspShader> shaders;
+	std::vector<BspPlane> planes;
 	std::vector<BspLeaf> leafs;
 	std::vector<std::int32_t> leafSurfaces;
 	std::vector<std::int32_t> leafBrushes;
@@ -1308,16 +1389,14 @@ struct BspMap {
 };
 
 struct LeafAcoustics {
+	// Contents of brushes that actually contain the volume, not of every brush
+	// the leaf happens to reference.
 	std::int32_t contents = 0;
-	std::int32_t surfaceFlags = 0;
-	double neutralVotes = 0.0;
-	double liquidVotes = 0.0;
-	double skyVotes = 0.0;
-	double stoneVotes = 0.0;
-	double metalVotes = 0.0;
-	double softVotes = 0.0;
+	std::array<double, static_cast<std::size_t>( azfmt::MaterialClass::Count )> materialVotes = {};
 	std::array<double, static_cast<std::size_t>( azfmt::Preset::Count )> presetVotes = {};
-	std::uint8_t flags = 0;
+	double drawSurfaceWeight = 0.0;
+	double skyDrawSurfaceWeight = 0.0;
+	std::uint8_t overrideFlags = 0;
 };
 
 struct GeneratedZone {
@@ -1326,27 +1405,6 @@ struct GeneratedZone {
 	int cluster = -1;
 	float weight = 1.0f;
 	LeafAcoustics acoustics;
-	std::array<double, static_cast<std::size_t>( azfmt::MaterialClass::Count )> materialWeights = {};
-};
-
-struct GeneratedZoneKey {
-	int area = -1;
-	int cluster = -1;
-	std::uint8_t material = 0;
-	std::uint8_t flags = 0;
-
-	bool operator<( const GeneratedZoneKey &other ) const {
-		if ( area != other.area ) {
-			return area < other.area;
-		}
-		if ( cluster != other.cluster ) {
-			return cluster < other.cluster;
-		}
-		if ( material != other.material ) {
-			return material < other.material;
-		}
-		return flags < other.flags;
-	}
 };
 
 static std::int32_t ReadBspI32At( const std::vector<std::uint8_t> &data, std::size_t offset ) {
@@ -1358,6 +1416,13 @@ static std::int32_t ReadBspI32At( const std::vector<std::uint8_t> &data, std::si
 		( static_cast<std::uint32_t>( data[offset + 2u] ) << 16u ) |
 		( static_cast<std::uint32_t>( data[offset + 3u] ) << 24u );
 	return static_cast<std::int32_t>( value );
+}
+
+static float ReadBspF32At( const std::vector<std::uint8_t> &data, std::size_t offset ) {
+	const std::uint32_t bits = static_cast<std::uint32_t>( ReadBspI32At( data, offset ) );
+	float value = 0.0f;
+	std::memcpy( &value, &bits, sizeof( value ) );
+	return std::isfinite( value ) ? value : 0.0f;
 }
 
 static std::string ReadBspStringAt( const std::vector<std::uint8_t> &data, std::size_t offset, std::size_t maxLength ) {
@@ -1448,6 +1513,7 @@ static bool LoadBspMap( const std::filesystem::path &path, BspMap &map, std::str
 	}
 
 	if ( !ValidateLumpRecordSize( lumps[BspLumpShaders], 72u, "shader", error ) ||
+		!ValidateLumpRecordSize( lumps[BspLumpPlanes], 16u, "plane", error ) ||
 		!ValidateLumpRecordSize( lumps[BspLumpLeafs], 48u, "leaf", error ) ||
 		!ValidateLumpRecordSize( lumps[BspLumpLeafSurfaces], 4u, "leaf-surface", error ) ||
 		!ValidateLumpRecordSize( lumps[BspLumpLeafBrushes], 4u, "leaf-brush", error ) ||
@@ -1465,6 +1531,40 @@ static bool LoadBspMap( const std::filesystem::path &path, BspMap &map, std::str
 		shader.surfaceFlags = ReadBspI32At( data, offset + 64u );
 		shader.contentFlags = ReadBspI32At( data, offset + 68u );
 		map.shaders.push_back( shader );
+	}
+
+	// The world model bounds are the extent of the actual map. BSP leaves outside
+	// the sealed hull can carry the engine's world-coordinate limits instead, and
+	// one such leaf is large enough to swallow the whole map during merging.
+	const BspLump &modelLump = lumps[BspLumpModels];
+	if ( modelLump.length >= 40u ) {
+		Vec3 mins;
+		Vec3 maxs;
+		mins.x = ReadBspF32At( data, modelLump.offset );
+		mins.y = ReadBspF32At( data, modelLump.offset + 4u );
+		mins.z = ReadBspF32At( data, modelLump.offset + 8u );
+		maxs.x = ReadBspF32At( data, modelLump.offset + 12u );
+		maxs.y = ReadBspF32At( data, modelLump.offset + 16u );
+		maxs.z = ReadBspF32At( data, modelLump.offset + 20u );
+		NormalizeVecBounds( mins, maxs );
+		if ( maxs.x - mins.x >= kMinimumLeafExtent &&
+			maxs.y - mins.y >= kMinimumLeafExtent &&
+			maxs.z - mins.z >= kMinimumLeafExtent ) {
+			map.worldMins = mins;
+			map.worldMaxs = maxs;
+			map.haveWorldBounds = true;
+		}
+	}
+
+	const BspLump &planeLump = lumps[BspLumpPlanes];
+	map.planes.reserve( planeLump.length / 16u );
+	for ( std::size_t offset = planeLump.offset; offset < planeLump.offset + planeLump.length; offset += 16u ) {
+		BspPlane plane;
+		plane.normal.x = ReadBspF32At( data, offset );
+		plane.normal.y = ReadBspF32At( data, offset + 4u );
+		plane.normal.z = ReadBspF32At( data, offset + 8u );
+		plane.distance = ReadBspF32At( data, offset + 12u );
+		map.planes.push_back( plane );
 	}
 
 	const BspLump &leafLump = lumps[BspLumpLeafs];
@@ -1534,6 +1634,16 @@ static bool LoadBspMap( const std::filesystem::path &path, BspMap &map, std::str
 		return false;
 	}
 	return true;
+}
+
+static float AxisOverlap( float aMin, float aMax, float bMin, float bMax ) {
+	return ( std::min )( aMax, bMax ) - ( std::max )( aMin, bMin );
+}
+
+static float BoundsVolume( const Vec3 &mins, const Vec3 &maxs ) {
+	return ( std::max )( 1.0f, maxs.x - mins.x ) *
+		( std::max )( 1.0f, maxs.y - mins.y ) *
+		( std::max )( 1.0f, maxs.z - mins.z );
 }
 
 static float ExtentX( const Zone &zone ) {
@@ -1738,45 +1848,52 @@ static bool ShaderNameMatchesRule( const std::string &shaderName, const Material
 }
 
 static void AddMaterialVote( LeafAcoustics &acoustics, std::uint8_t materialClass, double weight ) {
-	switch ( static_cast<azfmt::MaterialClass>( materialClass ) ) {
-	case azfmt::MaterialClass::Neutral:
-		acoustics.neutralVotes += weight;
-		break;
-	case azfmt::MaterialClass::Liquid:
-		acoustics.liquidVotes += weight;
-		break;
-	case azfmt::MaterialClass::Sky:
-		acoustics.skyVotes += weight;
-		break;
-	case azfmt::MaterialClass::Stone:
-		acoustics.stoneVotes += weight;
-		break;
-	case azfmt::MaterialClass::Metal:
-		acoustics.metalVotes += weight;
-		break;
-	case azfmt::MaterialClass::Soft:
-		acoustics.softVotes += weight;
-		break;
-	case azfmt::MaterialClass::Unknown:
-	case azfmt::MaterialClass::Count:
-	default:
-		break;
+	if ( materialClass >= static_cast<std::uint8_t>( azfmt::MaterialClass::Count ) ||
+		materialClass == static_cast<std::uint8_t>( azfmt::MaterialClass::Unknown ) ) {
+		return;
 	}
+	acoustics.materialVotes[materialClass] += weight;
 }
 
 static void MergeLeafAcoustics( LeafAcoustics &target, const LeafAcoustics &source ) {
 	target.contents |= source.contents;
-	target.surfaceFlags |= source.surfaceFlags;
-	target.neutralVotes += source.neutralVotes;
-	target.liquidVotes += source.liquidVotes;
-	target.skyVotes += source.skyVotes;
-	target.stoneVotes += source.stoneVotes;
-	target.metalVotes += source.metalVotes;
-	target.softVotes += source.softVotes;
+	for ( std::size_t i = 0; i < target.materialVotes.size(); ++i ) {
+		target.materialVotes[i] += source.materialVotes[i];
+	}
 	for ( std::size_t i = 0; i < target.presetVotes.size(); ++i ) {
 		target.presetVotes[i] += source.presetVotes[i];
 	}
-	target.flags = static_cast<std::uint8_t>( target.flags | source.flags );
+	target.drawSurfaceWeight += source.drawSurfaceWeight;
+	target.skyDrawSurfaceWeight += source.skyDrawSurfaceWeight;
+	target.overrideFlags = static_cast<std::uint8_t>( target.overrideFlags | source.overrideFlags );
+}
+
+static double SkyDrawSurfaceFraction( const LeafAcoustics &acoustics ) {
+	if ( acoustics.drawSurfaceWeight <= 0.0 ) {
+		return 0.0;
+	}
+	return acoustics.skyDrawSurfaceWeight / acoustics.drawSurfaceWeight;
+}
+
+// Open air is decided by how much of what the volume can see is sky. A huge
+// volume needs proportionally less of it: the void of a space map sees a lot of
+// platform geometry and only a little skybox, but it is still open air rather
+// than a reverberant hall.
+static bool AcousticsAreOutdoor( const LeafAcoustics &acoustics, const Vec3 &mins, const Vec3 &maxs ) {
+	if ( ( acoustics.overrideFlags & azfmt::ZoneFlagOutdoor ) != 0 ) {
+		return true;
+	}
+	if ( acoustics.skyDrawSurfaceWeight <= 0.0 ) {
+		return false;
+	}
+	const float volume = BoundsVolume( mins, maxs );
+	const double required = volume >= kOpenAirVolume ? kOpenAirSkyFraction : kOutdoorSkyFraction;
+	return SkyDrawSurfaceFraction( acoustics ) >= required;
+}
+
+static bool AcousticsAreUnderwater( const LeafAcoustics &acoustics ) {
+	return ( acoustics.contents & ( CONTENTS_WATER | CONTENTS_SLIME | CONTENTS_LAVA ) ) != 0 ||
+		( acoustics.overrideFlags & azfmt::ZoneFlagUnderwater ) != 0;
 }
 
 static int DominantPresetOverride( const LeafAcoustics &acoustics ) {
@@ -1792,61 +1909,92 @@ static int DominantPresetOverride( const LeafAcoustics &acoustics ) {
 }
 
 static void AccumulateShaderAcoustics( const BspShader &shader, const std::vector<MaterialOverrideRule> &overrides, float roleWeight, LeafAcoustics &acoustics ) {
-	acoustics.surfaceFlags |= shader.surfaceFlags;
-	if ( shader.surfaceFlags & SURF_SKY ) {
-		acoustics.skyVotes += roleWeight;
-	}
+	const double weight = static_cast<double>( roleWeight );
 	if ( shader.surfaceFlags & SURF_METALSTEPS ) {
-		acoustics.metalVotes += roleWeight;
+		AddMaterialVote( acoustics, static_cast<std::uint8_t>( azfmt::MaterialClass::Metal ), weight );
 	}
 	if ( shader.surfaceFlags & SURF_FLESH ) {
-		acoustics.softVotes += roleWeight;
+		AddMaterialVote( acoustics, static_cast<std::uint8_t>( azfmt::MaterialClass::Soft ), weight );
 	}
 
 	const std::string name = LowercasePathToken( shader.name );
-	if ( ContainsAnyToken( name, { "sky", "skies/" } ) ) {
-		acoustics.skyVotes += roleWeight;
+	if ( ( shader.surfaceFlags & SURF_SKY ) != 0 || ContainsAnyToken( name, { "skies/", "/sky" } ) ) {
+		AddMaterialVote( acoustics, static_cast<std::uint8_t>( azfmt::MaterialClass::Sky ), weight );
 	}
 	if ( ContainsAnyToken( name, { "water", "slime", "lava", "liquid", "pool", "slosh" } ) ) {
-		acoustics.liquidVotes += roleWeight;
+		AddMaterialVote( acoustics, static_cast<std::uint8_t>( azfmt::MaterialClass::Liquid ), weight );
 	}
-	if ( ContainsAnyToken( name, { "stone", "rock", "gothic", "brick", "concrete", "cement", "base_wall" } ) ) {
-		acoustics.stoneVotes += roleWeight;
+	if ( ContainsAnyToken( name, { "stone", "rock", "gothic", "brick", "concrete", "cement", "base_wall", "marble", "tile" } ) ) {
+		AddMaterialVote( acoustics, static_cast<std::uint8_t>( azfmt::MaterialClass::Stone ), weight );
 	}
-	if ( ContainsAnyToken( name, { "metal", "grate", "proto", "base_trim", "clang" } ) ) {
-		acoustics.metalVotes += roleWeight;
+	if ( ContainsAnyToken( name, { "metal", "grate", "proto", "base_trim", "clang", "steel", "iron" } ) ) {
+		AddMaterialVote( acoustics, static_cast<std::uint8_t>( azfmt::MaterialClass::Metal ), weight );
 	}
-	if ( ContainsAnyToken( name, { "flesh", "organic", "cloth", "terrain", "grass", "sand", "dirt" } ) ) {
-		acoustics.softVotes += roleWeight;
+	if ( ContainsAnyToken( name, { "flesh", "organic", "cloth", "terrain", "grass", "sand", "dirt", "carpet", "wood" } ) ) {
+		AddMaterialVote( acoustics, static_cast<std::uint8_t>( azfmt::MaterialClass::Soft ), weight );
 	}
 
 	for ( const MaterialOverrideRule &rule : overrides ) {
 		if ( !ShaderNameMatchesRule( name, rule ) ) {
 			continue;
 		}
-		const double weighted = static_cast<double>( roleWeight ) * static_cast<double>( rule.weight );
+		const double weighted = weight * static_cast<double>( rule.weight );
 		AddMaterialVote( acoustics, rule.materialClass, weighted );
 		if ( rule.preset >= 0 && rule.preset < static_cast<int>( acoustics.presetVotes.size() ) ) {
 			acoustics.presetVotes[static_cast<std::size_t>( rule.preset )] += weighted;
 		}
-		acoustics.flags = static_cast<std::uint8_t>( acoustics.flags | rule.flags );
+		acoustics.overrideFlags = static_cast<std::uint8_t>( acoustics.overrideFlags | rule.flags );
 	}
 }
 
-static LeafAcoustics AnalyzeLeafAcoustics( const BspMap &map, const BspLeaf &leaf, const std::vector<MaterialOverrideRule> &overrides ) {
+// A BSP leaf is convex, so testing its centre against the brush half-spaces is
+// enough to tell "the leaf is inside this brush" from "the leaf merely lists a
+// neighbouring brush".
+static bool BrushContainsPoint( const BspMap &map, const BspBrush &brush, const Vec3 &point ) {
+	if ( brush.numSides <= 0 || brush.firstSide < 0 ||
+		static_cast<std::size_t>( brush.firstSide ) >= map.brushSides.size() ) {
+		return false;
+	}
+	const std::size_t begin = static_cast<std::size_t>( brush.firstSide );
+	if ( static_cast<std::size_t>( brush.numSides ) > map.brushSides.size() - begin ) {
+		return false;
+	}
+	for ( std::size_t i = 0; i < static_cast<std::size_t>( brush.numSides ); ++i ) {
+		const BspBrushSide &side = map.brushSides[begin + i];
+		if ( side.planeNum < 0 || static_cast<std::size_t>( side.planeNum ) >= map.planes.size() ) {
+			return false;
+		}
+		const BspPlane &plane = map.planes[static_cast<std::size_t>( side.planeNum )];
+		const float distance = point.x * plane.normal.x + point.y * plane.normal.y + point.z * plane.normal.z - plane.distance;
+		if ( distance > kBrushContainmentEpsilon ) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static LeafAcoustics AnalyzeLeafAcoustics( const BspMap &map, const BspLeaf &leaf, const Vec3 &center, const std::vector<MaterialOverrideRule> &overrides ) {
 	LeafAcoustics acoustics;
+
 	if ( leaf.firstLeafSurface >= 0 && leaf.numLeafSurfaces > 0 &&
 		static_cast<std::size_t>( leaf.firstLeafSurface ) <= map.leafSurfaces.size() ) {
 		const std::size_t begin = static_cast<std::size_t>( leaf.firstLeafSurface );
 		const std::size_t count = ( std::min )( static_cast<std::size_t>( leaf.numLeafSurfaces ), map.leafSurfaces.size() - begin );
 		for ( std::size_t i = 0; i < count; ++i ) {
 			const std::int32_t surfaceIndex = map.leafSurfaces[begin + i];
-			if ( surfaceIndex >= 0 && static_cast<std::size_t>( surfaceIndex ) < map.surfaces.size() ) {
-				const std::int32_t shaderNum = map.surfaces[static_cast<std::size_t>( surfaceIndex )].shaderNum;
-				if ( shaderNum >= 0 && static_cast<std::size_t>( shaderNum ) < map.shaders.size() ) {
-					AccumulateShaderAcoustics( map.shaders[static_cast<std::size_t>( shaderNum )], overrides, 2.0f, acoustics );
-				}
+			if ( surfaceIndex < 0 || static_cast<std::size_t>( surfaceIndex ) >= map.surfaces.size() ) {
+				continue;
 			}
+			const std::int32_t shaderNum = map.surfaces[static_cast<std::size_t>( surfaceIndex )].shaderNum;
+			if ( shaderNum < 0 || static_cast<std::size_t>( shaderNum ) >= map.shaders.size() ) {
+				continue;
+			}
+			const BspShader &shader = map.shaders[static_cast<std::size_t>( shaderNum )];
+			acoustics.drawSurfaceWeight += static_cast<double>( kDrawSurfaceRoleWeight );
+			if ( shader.surfaceFlags & SURF_SKY ) {
+				acoustics.skyDrawSurfaceWeight += static_cast<double>( kDrawSurfaceRoleWeight );
+			}
+			AccumulateShaderAcoustics( shader, overrides, kDrawSurfaceRoleWeight, acoustics );
 		}
 	}
 
@@ -1860,9 +2008,12 @@ static LeafAcoustics AnalyzeLeafAcoustics( const BspMap &map, const BspLeaf &lea
 				continue;
 			}
 			const BspBrush &brush = map.brushes[static_cast<std::size_t>( brushIndex )];
-			acoustics.contents |= brush.contentFlags;
+			if ( ( brush.contentFlags & ( CONTENTS_WATER | CONTENTS_SLIME | CONTENTS_LAVA ) ) != 0 &&
+				BrushContainsPoint( map, brush, center ) ) {
+				acoustics.contents |= brush.contentFlags;
+			}
 			if ( brush.shaderNum >= 0 && static_cast<std::size_t>( brush.shaderNum ) < map.shaders.size() ) {
-				AccumulateShaderAcoustics( map.shaders[static_cast<std::size_t>( brush.shaderNum )], overrides, 1.25f, acoustics );
+				AccumulateShaderAcoustics( map.shaders[static_cast<std::size_t>( brush.shaderNum )], overrides, kBrushBodyRoleWeight, acoustics );
 			}
 			if ( brush.firstSide >= 0 && brush.numSides > 0 &&
 				static_cast<std::size_t>( brush.firstSide ) <= map.brushSides.size() ) {
@@ -1870,9 +2021,11 @@ static LeafAcoustics AnalyzeLeafAcoustics( const BspMap &map, const BspLeaf &lea
 				const std::size_t sideCount = ( std::min )( static_cast<std::size_t>( brush.numSides ), map.brushSides.size() - sideBegin );
 				for ( std::size_t sideIndex = 0; sideIndex < sideCount; ++sideIndex ) {
 					const BspBrushSide &side = map.brushSides[sideBegin + sideIndex];
-					acoustics.surfaceFlags |= side.surfaceFlags;
+					if ( side.surfaceFlags & ( SURF_NODRAW | SURF_SKIP | SURF_HINT ) ) {
+						continue;
+					}
 					if ( side.shaderNum >= 0 && static_cast<std::size_t>( side.shaderNum ) < map.shaders.size() ) {
-						AccumulateShaderAcoustics( map.shaders[static_cast<std::size_t>( side.shaderNum )], overrides, 0.75f, acoustics );
+						AccumulateShaderAcoustics( map.shaders[static_cast<std::size_t>( side.shaderNum )], overrides, kBrushSideRoleWeight, acoustics );
 					}
 				}
 			}
@@ -1882,48 +2035,50 @@ static LeafAcoustics AnalyzeLeafAcoustics( const BspMap &map, const BspLeaf &lea
 }
 
 static std::uint8_t MaterialFromAcoustics( const LeafAcoustics &acoustics ) {
-	if ( acoustics.contents & ( CONTENTS_WATER | CONTENTS_SLIME | CONTENTS_LAVA ) ) {
+	const bool underwater = AcousticsAreUnderwater( acoustics );
+	if ( underwater ) {
 		return static_cast<std::uint8_t>( azfmt::MaterialClass::Liquid );
 	}
-	const double bestVote = ( std::max )( acoustics.neutralVotes, ( std::max )( acoustics.liquidVotes, ( std::max )( acoustics.skyVotes, ( std::max )( acoustics.metalVotes, ( std::max )( acoustics.stoneVotes, acoustics.softVotes ) ) ) ) );
-	if ( bestVote <= 0.0 ) {
-		return static_cast<std::uint8_t>( azfmt::MaterialClass::Neutral );
+
+	std::uint8_t best = static_cast<std::uint8_t>( azfmt::MaterialClass::Neutral );
+	double bestVote = 0.0;
+	for ( std::size_t i = 0; i < acoustics.materialVotes.size(); ++i ) {
+		// Dry volumes next to water still see the liquid surface, but that is a
+		// neighbouring material rather than the medium the listener is in.
+		if ( i == static_cast<std::size_t>( azfmt::MaterialClass::Liquid ) ||
+			i == static_cast<std::size_t>( azfmt::MaterialClass::Unknown ) ) {
+			continue;
+		}
+		if ( acoustics.materialVotes[i] > bestVote ) {
+			bestVote = acoustics.materialVotes[i];
+			best = static_cast<std::uint8_t>( i );
+		}
 	}
-	if ( acoustics.neutralVotes >= bestVote ) {
-		return static_cast<std::uint8_t>( azfmt::MaterialClass::Neutral );
-	}
-	if ( acoustics.liquidVotes >= bestVote ) {
-		return static_cast<std::uint8_t>( azfmt::MaterialClass::Liquid );
-	}
-	if ( acoustics.skyVotes >= bestVote ) {
-		return static_cast<std::uint8_t>( azfmt::MaterialClass::Sky );
-	}
-	if ( acoustics.metalVotes >= bestVote ) {
-		return static_cast<std::uint8_t>( azfmt::MaterialClass::Metal );
-	}
-	if ( acoustics.stoneVotes >= bestVote ) {
-		return static_cast<std::uint8_t>( azfmt::MaterialClass::Stone );
-	}
-	return static_cast<std::uint8_t>( azfmt::MaterialClass::Soft );
+	return bestVote > 0.0 ? best : static_cast<std::uint8_t>( azfmt::MaterialClass::Neutral );
 }
 
-static std::uint8_t GeneratedFlagsFromAcoustics( const LeafAcoustics &acoustics, std::uint8_t material ) {
-	std::uint8_t flags = static_cast<std::uint8_t>( acoustics.flags & kGeneratedEnvironmentFlags );
-	if ( ( acoustics.contents & ( CONTENTS_WATER | CONTENTS_SLIME | CONTENTS_LAVA ) ) ||
-		material == static_cast<std::uint8_t>( azfmt::MaterialClass::Liquid ) ) {
+static std::uint8_t GeneratedFlagsFromAcoustics( const LeafAcoustics &acoustics, const Vec3 &mins, const Vec3 &maxs ) {
+	std::uint8_t flags = static_cast<std::uint8_t>( acoustics.overrideFlags & kGeneratedEnvironmentFlags );
+	if ( AcousticsAreUnderwater( acoustics ) ) {
 		flags = static_cast<std::uint8_t>( flags | azfmt::ZoneFlagUnderwater );
+	}
+	if ( AcousticsAreOutdoor( acoustics, mins, maxs ) ) {
+		flags = static_cast<std::uint8_t>( flags | azfmt::ZoneFlagOutdoor );
 	}
 	return flags;
 }
 
+// Room scale and shape pick the preset; the acoustic material only decides
+// whether a room-sized volume is the hard-walled stone-room variant. Letting the
+// material short-circuit the size test collapsed almost every zone in a stock
+// Quake map into stone-room, because stock Quake surfaces are nearly all stone
+// or metal.
 static std::uint32_t PresetFromBounds( const Vec3 &mins, const Vec3 &maxs, const LeafAcoustics &acoustics, std::uint8_t material ) {
 	const int overridePreset = DominantPresetOverride( acoustics );
 	if ( overridePreset >= 0 ) {
 		return static_cast<std::uint32_t>( overridePreset );
 	}
-	if ( ( acoustics.contents & ( CONTENTS_WATER | CONTENTS_SLIME | CONTENTS_LAVA ) ) ||
-		( acoustics.flags & azfmt::ZoneFlagUnderwater ) != 0 ||
-		material == static_cast<std::uint8_t>( azfmt::MaterialClass::Liquid ) ) {
+	if ( AcousticsAreUnderwater( acoustics ) ) {
 		return static_cast<std::uint32_t>( azfmt::Preset::Underwater );
 	}
 
@@ -1934,13 +2089,8 @@ static std::uint32_t PresetFromBounds( const Vec3 &mins, const Vec3 &maxs, const
 	const float horizontalMax = ( std::max )( x, y );
 	const float horizontalRatio = horizontalMax / ( std::max )( kMinimumLeafExtent, horizontalMin );
 	const float volume = x * y * z;
-	const bool skyLike = material == static_cast<std::uint8_t>( azfmt::MaterialClass::Sky ) ||
-		( acoustics.surfaceFlags & SURF_SKY ) != 0 ||
-		( acoustics.flags & azfmt::ZoneFlagOutdoor ) != 0 ||
-		acoustics.skyVotes > 0.0;
 
-	if ( skyLike && ( ( acoustics.flags & azfmt::ZoneFlagOutdoor ) != 0 ||
-		z > 160.0f || horizontalMax > 384.0f || volume > 4.0f * 1024.0f * 1024.0f ) ) {
+	if ( AcousticsAreOutdoor( acoustics, mins, maxs ) && ( horizontalMax >= 256.0f || z >= 192.0f ) ) {
 		return static_cast<std::uint32_t>( azfmt::Preset::Outdoors );
 	}
 	if ( volume > 96.0f * 1024.0f * 1024.0f || horizontalMax > 1536.0f || z > 768.0f ) {
@@ -1949,12 +2099,13 @@ static std::uint32_t PresetFromBounds( const Vec3 &mins, const Vec3 &maxs, const
 	if ( horizontalRatio > 2.8f && horizontalMin < 384.0f && horizontalMax >= 256.0f && z <= 512.0f ) {
 		return static_cast<std::uint32_t>( azfmt::Preset::Hallway );
 	}
-	if ( material == static_cast<std::uint8_t>( azfmt::MaterialClass::Stone ) ||
-		material == static_cast<std::uint8_t>( azfmt::MaterialClass::Metal ) ) {
-		return static_cast<std::uint32_t>( azfmt::Preset::StoneRoom );
-	}
+
+	const bool hardSurfaced = material == static_cast<std::uint8_t>( azfmt::MaterialClass::Stone ) ||
+		material == static_cast<std::uint8_t>( azfmt::MaterialClass::Metal );
 	if ( volume > 8.0f * 1024.0f * 1024.0f || horizontalMax > 512.0f || z > 320.0f ) {
-		return static_cast<std::uint32_t>( azfmt::Preset::Room );
+		return hardSurfaced
+			? static_cast<std::uint32_t>( azfmt::Preset::StoneRoom )
+			: static_cast<std::uint32_t>( azfmt::Preset::Room );
 	}
 	return static_cast<std::uint32_t>( azfmt::Preset::SmallRoom );
 }
@@ -2026,64 +2177,35 @@ static void ApplyGeneratedTuning( Zone &zone ) {
 	}
 }
 
-static std::int32_t GeneratedPriority( std::uint32_t preset ) {
-	switch ( static_cast<azfmt::Preset>( preset ) ) {
-	case azfmt::Preset::Underwater:
-		return -40;
-	case azfmt::Preset::SmallRoom:
-		return -55;
-	case azfmt::Preset::Hallway:
-		return -60;
-	case azfmt::Preset::Room:
-	case azfmt::Preset::StoneRoom:
-		return -70;
-	case azfmt::Preset::Hall:
-		return -80;
-	case azfmt::Preset::Outdoors:
-	default:
-		return -90;
-	}
-}
-
-static bool LeafBoundsUsable( const BspLeaf &leaf ) {
+// Clips a leaf to the world model bounds and reports whether anything usable is
+// left. Opaque leaves and slivers are rejected outright.
+static bool ClipLeafBounds( const BspMap &map, const BspLeaf &leaf, Vec3 &mins, Vec3 &maxs ) {
 	if ( leaf.cluster < 0 ) {
 		return false;
 	}
-	const float x = leaf.maxs.x - leaf.mins.x;
-	const float y = leaf.maxs.y - leaf.mins.y;
-	const float z = leaf.maxs.z - leaf.mins.z;
+	mins = leaf.mins;
+	maxs = leaf.maxs;
+	if ( map.haveWorldBounds ) {
+		mins.x = ( std::max )( mins.x, map.worldMins.x );
+		mins.y = ( std::max )( mins.y, map.worldMins.y );
+		mins.z = ( std::max )( mins.z, map.worldMins.z );
+		maxs.x = ( std::min )( maxs.x, map.worldMaxs.x );
+		maxs.y = ( std::min )( maxs.y, map.worldMaxs.y );
+		maxs.z = ( std::min )( maxs.z, map.worldMaxs.z );
+	}
+	const float x = maxs.x - mins.x;
+	const float y = maxs.y - mins.y;
+	const float z = maxs.z - mins.z;
 	return std::isfinite( x ) && std::isfinite( y ) && std::isfinite( z ) &&
 		x >= kMinimumLeafExtent && y >= kMinimumLeafExtent && z >= kMinimumLeafExtent;
 }
 
-static std::uint8_t DominantMaterialFromWeights( const std::array<double, static_cast<std::size_t>( azfmt::MaterialClass::Count )> &weights, std::uint8_t fallback ) {
-	std::uint8_t best = fallback;
-	double bestWeight = 0.0;
-	for ( std::size_t i = 0; i < weights.size(); ++i ) {
-		if ( weights[i] > bestWeight ) {
-			bestWeight = weights[i];
-			best = static_cast<std::uint8_t>( i );
-		}
-	}
-	return bestWeight > 0.0 ? best : fallback;
-}
-
 static void FinalizeGeneratedZone( GeneratedZone &generated ) {
-	generated.zone.materialClass = DominantMaterialFromWeights( generated.materialWeights, generated.zone.materialClass );
+	generated.zone.materialClass = MaterialFromAcoustics( generated.acoustics );
 	generated.zone.preset = PresetFromBounds( generated.zone.mins, generated.zone.maxs, generated.acoustics, generated.zone.materialClass );
 	generated.zone.flags = static_cast<std::uint8_t>(
-		azfmt::ZoneFlagGenerated | GeneratedFlagsFromAcoustics( generated.acoustics, generated.zone.materialClass ) );
+		azfmt::ZoneFlagGenerated | GeneratedFlagsFromAcoustics( generated.acoustics, generated.zone.mins, generated.zone.maxs ) );
 	ApplyGeneratedTuning( generated.zone );
-}
-
-static float AxisOverlap( float aMin, float aMax, float bMin, float bMax ) {
-	return ( std::min )( aMax, bMax ) - ( std::max )( aMin, bMin );
-}
-
-static float BoundsVolume( const Vec3 &mins, const Vec3 &maxs ) {
-	return ( std::max )( 1.0f, maxs.x - mins.x ) *
-		( std::max )( 1.0f, maxs.y - mins.y ) *
-		( std::max )( 1.0f, maxs.z - mins.z );
 }
 
 static float ZoneOverlapVolume( const Zone &a, const Zone &b ) {
@@ -2103,62 +2225,6 @@ static float ZoneFaceArea( const Zone &zone, int axis ) {
 	return ( std::max )( 1.0f, ExtentX( zone ) ) * ( std::max )( 1.0f, ExtentY( zone ) );
 }
 
-struct ZoneAdjacency {
-	int axis = -1;
-	float gap = 0.0f;
-	std::array<float, 3> overlap = {};
-	float overlapArea = 0.0f;
-	float faceAreaA = 1.0f;
-	float faceAreaB = 1.0f;
-	float coverageA = 0.0f;
-	float coverageB = 0.0f;
-};
-
-static bool MeasureZoneAdjacency( const Zone &a, const Zone &b, float maximumGap, float maximumSeparatingOverlap, ZoneAdjacency &best ) {
-	const std::array<float, 3> overlap = {
-		AxisOverlap( a.mins.x, a.maxs.x, b.mins.x, b.maxs.x ),
-		AxisOverlap( a.mins.y, a.maxs.y, b.mins.y, b.maxs.y ),
-		AxisOverlap( a.mins.z, a.maxs.z, b.mins.z, b.maxs.z )
-	};
-
-	bool found = false;
-	float bestCoverage = 0.0f;
-	float bestGap = std::numeric_limits<float>::max();
-	for ( int axis = 0; axis < 3; ++axis ) {
-		const float gap = overlap[axis] < 0.0f ? -overlap[axis] : 0.0f;
-		if ( gap > maximumGap || overlap[axis] > maximumSeparatingOverlap ) {
-			continue;
-		}
-
-		const int axisA = ( axis + 1 ) % 3;
-		const int axisB = ( axis + 2 ) % 3;
-		if ( overlap[axisA] <= 0.0f || overlap[axisB] <= 0.0f ) {
-			continue;
-		}
-
-		const float overlapArea = overlap[axisA] * overlap[axisB];
-		const float faceAreaA = ZoneFaceArea( a, axis );
-		const float faceAreaB = ZoneFaceArea( b, axis );
-		const float coverageA = overlapArea / ( std::max )( 1.0f, faceAreaA );
-		const float coverageB = overlapArea / ( std::max )( 1.0f, faceAreaB );
-		const float coverage = ( std::min )( coverageA, coverageB );
-		if ( !found || coverage > bestCoverage || ( coverage == bestCoverage && gap < bestGap ) ) {
-			found = true;
-			bestCoverage = coverage;
-			bestGap = gap;
-			best.axis = axis;
-			best.gap = gap;
-			best.overlap = overlap;
-			best.overlapArea = overlapArea;
-			best.faceAreaA = faceAreaA;
-			best.faceAreaB = faceAreaB;
-			best.coverageA = coverageA;
-			best.coverageB = coverageB;
-		}
-	}
-	return found;
-}
-
 static void MergeGeneratedZoneInto( GeneratedZone &target, const GeneratedZone &source ) {
 	const float targetWeight = ( std::max )( 1.0f, target.weight );
 	const float sourceWeight = ( std::max )( 1.0f, source.weight );
@@ -2171,11 +2237,172 @@ static void MergeGeneratedZoneInto( GeneratedZone &target, const GeneratedZone &
 		target.cluster = -1;
 	}
 	MergeLeafAcoustics( target.acoustics, source.acoustics );
-	for ( std::size_t i = 0; i < target.materialWeights.size(); ++i ) {
-		target.materialWeights[i] += source.materialWeights[i];
-	}
 	target.weight = totalWeight;
 	FinalizeGeneratedZone( target );
+}
+
+// The open contact area between two volumes, accumulated per axis along with the
+// bounds of the contact rectangles.
+//
+// This is the difference between "one room a BSP plane happened to cut in half"
+// and "two rooms sharing a wall with a door in it". Both look identical when you
+// only compare bounding boxes: in each case the two boxes sit face to face and
+// cover each other completely. Only the real leaf-to-leaf contact area tells
+// them apart, because the door contributes a fraction of the wall area while the
+// BSP cut contributes all of it.
+struct ZoneAperture {
+	std::array<double, 3> areaByAxis = {};
+	Vec3 mins;
+	Vec3 maxs;
+	bool haveBounds = false;
+
+	double TotalArea() const {
+		return areaByAxis[0] + areaByAxis[1] + areaByAxis[2];
+	}
+
+	int DominantAxis() const {
+		int axis = 0;
+		for ( int i = 1; i < 3; ++i ) {
+			if ( areaByAxis[i] > areaByAxis[axis] ) {
+				axis = i;
+			}
+		}
+		return axis;
+	}
+};
+
+static void ExpandApertureBounds( ZoneAperture &aperture, const Vec3 &mins, const Vec3 &maxs ) {
+	if ( !aperture.haveBounds ) {
+		aperture.mins = mins;
+		aperture.maxs = maxs;
+		aperture.haveBounds = true;
+		return;
+	}
+	aperture.mins.x = ( std::min )( aperture.mins.x, mins.x );
+	aperture.mins.y = ( std::min )( aperture.mins.y, mins.y );
+	aperture.mins.z = ( std::min )( aperture.mins.z, mins.z );
+	aperture.maxs.x = ( std::max )( aperture.maxs.x, maxs.x );
+	aperture.maxs.y = ( std::max )( aperture.maxs.y, maxs.y );
+	aperture.maxs.z = ( std::max )( aperture.maxs.z, maxs.z );
+}
+
+static void MergeApertures( ZoneAperture &target, const ZoneAperture &source ) {
+	for ( int i = 0; i < 3; ++i ) {
+		target.areaByAxis[i] += source.areaByAxis[i];
+	}
+	if ( source.haveBounds ) {
+		ExpandApertureBounds( target, source.mins, source.maxs );
+	}
+}
+
+// Measures where two leaf boxes touch. Leaves partition space, so a shared face
+// means the volumes are directly connected; a gap means solid geometry sits
+// between them.
+static bool MeasureLeafAperture( const Zone &a, const Zone &b, float gapEpsilon, ZoneAperture &aperture ) {
+	const std::array<float, 3> aMins = { a.mins.x, a.mins.y, a.mins.z };
+	const std::array<float, 3> aMaxs = { a.maxs.x, a.maxs.y, a.maxs.z };
+	const std::array<float, 3> bMins = { b.mins.x, b.mins.y, b.mins.z };
+	const std::array<float, 3> bMaxs = { b.maxs.x, b.maxs.y, b.maxs.z };
+	std::array<float, 3> overlap = {};
+	for ( int axis = 0; axis < 3; ++axis ) {
+		overlap[axis] = AxisOverlap( aMins[axis], aMaxs[axis], bMins[axis], bMaxs[axis] );
+		if ( overlap[axis] < -gapEpsilon ) {
+			return false;
+		}
+	}
+
+	int bestAxis = -1;
+	float bestArea = 0.0f;
+	for ( int axis = 0; axis < 3; ++axis ) {
+		const int axisA = ( axis + 1 ) % 3;
+		const int axisB = ( axis + 2 ) % 3;
+		if ( overlap[axisA] <= 0.0f || overlap[axisB] <= 0.0f ) {
+			continue;
+		}
+		const float area = overlap[axisA] * overlap[axisB];
+		// Prefer the axis the two boxes actually meet on. When they interpenetrate
+		// on every axis, the thinnest overlap is the contact direction.
+		const bool contact = overlap[axis] <= gapEpsilon;
+		const bool bestIsContact = bestAxis >= 0 && overlap[bestAxis] <= gapEpsilon;
+		if ( bestAxis < 0 || ( contact && !bestIsContact ) ||
+			( contact == bestIsContact && area > bestArea ) ) {
+			bestAxis = axis;
+			bestArea = area;
+		}
+	}
+	if ( bestAxis < 0 ) {
+		return false;
+	}
+
+	const int axisA = ( bestAxis + 1 ) % 3;
+	const int axisB = ( bestAxis + 2 ) % 3;
+	std::array<float, 3> mins = {};
+	std::array<float, 3> maxs = {};
+	mins[axisA] = ( std::max )( aMins[axisA], bMins[axisA] );
+	maxs[axisA] = ( std::min )( aMaxs[axisA], bMaxs[axisA] );
+	mins[axisB] = ( std::max )( aMins[axisB], bMins[axisB] );
+	maxs[axisB] = ( std::min )( aMaxs[axisB], bMaxs[axisB] );
+	const float plane = overlap[bestAxis] < 0.0f
+		? ( ( aMaxs[bestAxis] <= bMins[bestAxis] )
+			? ( aMaxs[bestAxis] + bMins[bestAxis] ) * 0.5f
+			: ( bMaxs[bestAxis] + aMins[bestAxis] ) * 0.5f )
+		: ( ( std::max )( aMins[bestAxis], bMins[bestAxis] ) + ( std::min )( aMaxs[bestAxis], bMaxs[bestAxis] ) ) * 0.5f;
+	mins[bestAxis] = plane;
+	maxs[bestAxis] = plane;
+
+	aperture = ZoneAperture();
+	aperture.areaByAxis[bestAxis] = static_cast<double>( bestArea );
+	aperture.mins = { mins[0], mins[1], mins[2] };
+	aperture.maxs = { maxs[0], maxs[1], maxs[2] };
+	aperture.haveBounds = true;
+	return true;
+}
+
+// Region adjacency graph over the generated zones. adjacency[i][j] holds the
+// accumulated open contact between zone i and zone j.
+using ZoneAdjacencyGraph = std::vector<std::map<std::size_t, ZoneAperture>>;
+
+// How open the connection feels from inside the smaller volume: a doorway fills
+// the whole wall of the corridor behind it even though it is a slot in the wall
+// of the hall in front of it. This is the right question for a portal hint.
+static float ApertureOpenness( const std::vector<GeneratedZone> &zones, std::size_t a, std::size_t b, const ZoneAperture &aperture ) {
+	const int axis = aperture.DominantAxis();
+	const float faceAreaA = ZoneFaceArea( zones[a].zone, axis );
+	const float faceAreaB = ZoneFaceArea( zones[b].zone, axis );
+	const float reference = ( std::max )( 1.0f, ( std::min )( faceAreaA, faceAreaB ) );
+	return ( std::min )( 1.0f, static_cast<float>( aperture.TotalArea() ) / reference );
+}
+
+// Merging asks a different question: are these two halves of one volume?
+//
+// A BSP plane cutting a room in two leaves both halves with the same
+// cross-section, so the opening covers *both* faces completely. An alcove, a
+// doorway or a corridor mouth covers its own face completely and only a slice of
+// the face it opens onto. Scoring against the geometric mean of the two faces
+// separates the two cases; scoring against the smaller face alone reads them as
+// identical, and the merge then walks from room to room until the map is a
+// single box.
+static float ApertureMergeCoverage( const std::vector<GeneratedZone> &zones, std::size_t a, std::size_t b, const ZoneAperture &aperture ) {
+	const int axis = aperture.DominantAxis();
+	const float faceAreaA = ( std::max )( 1.0f, ZoneFaceArea( zones[a].zone, axis ) );
+	const float faceAreaB = ( std::max )( 1.0f, ZoneFaceArea( zones[b].zone, axis ) );
+	const float reference = std::sqrt( faceAreaA * faceAreaB );
+	return ( std::min )( 1.0f, static_cast<float>( aperture.TotalArea() ) / reference );
+}
+
+static ZoneAdjacencyGraph BuildLeafAdjacencyGraph( const std::vector<GeneratedZone> &zones, float gapEpsilon ) {
+	ZoneAdjacencyGraph adjacency( zones.size() );
+	for ( std::size_t i = 0; i < zones.size(); ++i ) {
+		for ( std::size_t j = i + 1u; j < zones.size(); ++j ) {
+			ZoneAperture aperture;
+			if ( !MeasureLeafAperture( zones[i].zone, zones[j].zone, gapEpsilon, aperture ) ) {
+				continue;
+			}
+			adjacency[i][j] = aperture;
+			adjacency[j][i] = aperture;
+		}
+	}
+	return adjacency;
 }
 
 struct SplitMergeCandidate {
@@ -2184,45 +2411,25 @@ struct SplitMergeCandidate {
 	float score = 0.0f;
 };
 
-static bool GeneratedPresetCanMergeAsSplit( std::uint32_t a, std::uint32_t b ) {
-	if ( a == b ) {
-		return true;
-	}
-	const bool aOutdoor = a == static_cast<std::uint32_t>( azfmt::Preset::Outdoors );
-	const bool bOutdoor = b == static_cast<std::uint32_t>( azfmt::Preset::Outdoors );
-	const bool aUnderwater = a == static_cast<std::uint32_t>( azfmt::Preset::Underwater );
-	const bool bUnderwater = b == static_cast<std::uint32_t>( azfmt::Preset::Underwater );
-	return !aOutdoor && !bOutdoor && !aUnderwater && !bUnderwater;
+// Water and air are different media, so they never share a zone. Everything else
+// is free to merge: the preset, material and outdoor flag are all recomputed from
+// the combined evidence, which is what lets a courtyard chopped into sky-lit and
+// shaded leaves come back together as one outdoor volume.
+static bool GeneratedZonesCanMerge( const GeneratedZone &a, const GeneratedZone &b ) {
+	const std::uint8_t aUnderwater = static_cast<std::uint8_t>( a.zone.flags & azfmt::ZoneFlagUnderwater );
+	const std::uint8_t bUnderwater = static_cast<std::uint8_t>( b.zone.flags & azfmt::ZoneFlagUnderwater );
+	return aUnderwater == bUnderwater;
 }
 
-static bool GeneratedMaterialCanMergeAsSplit( std::uint8_t a, std::uint8_t b ) {
-	if ( a == b ) {
-		return true;
-	}
-	if ( a == static_cast<std::uint8_t>( azfmt::MaterialClass::Liquid ) ||
-		b == static_cast<std::uint8_t>( azfmt::MaterialClass::Liquid ) ) {
-		return false;
-	}
-	return true;
-}
-
-static bool BuildSplitMergeCandidate( const std::vector<GeneratedZone> &zones, std::size_t a, std::size_t b, SplitMergeCandidate &candidate ) {
+static bool BuildSplitMergeCandidate( const std::vector<GeneratedZone> &zones, std::size_t a, std::size_t b, const ZoneAperture &aperture, const MergeTuning &tuning, SplitMergeCandidate &candidate ) {
 	const GeneratedZone &zoneA = zones[a];
 	const GeneratedZone &zoneB = zones[b];
-	if ( zoneA.area != zoneB.area ||
-		!GeneratedMaterialCanMergeAsSplit( zoneA.zone.materialClass, zoneB.zone.materialClass ) ||
-		( zoneA.zone.flags & kGeneratedEnvironmentFlags ) != ( zoneB.zone.flags & kGeneratedEnvironmentFlags ) ||
-		!GeneratedPresetCanMergeAsSplit( zoneA.zone.preset, zoneB.zone.preset ) ) {
+	if ( !GeneratedZonesCanMerge( zoneA, zoneB ) ) {
 		return false;
 	}
 
-	ZoneAdjacency adjacency;
-	if ( !MeasureZoneAdjacency( zoneA.zone, zoneB.zone, kSplitZoneMergeGapEpsilon, kSplitZoneMergeOverlapEpsilon, adjacency ) ) {
-		return false;
-	}
-
-	const float minimumCoverage = ( std::min )( adjacency.coverageA, adjacency.coverageB );
-	if ( minimumCoverage < kSplitZoneMergeMinimumFaceCoverage ) {
+	const float coverage = ApertureMergeCoverage( zones, a, b, aperture );
+	if ( coverage < tuning.minimumFaceCoverage ) {
 		return false;
 	}
 
@@ -2238,29 +2445,54 @@ static bool BuildSplitMergeCandidate( const std::vector<GeneratedZone> &zones, s
 	};
 	const float combinedVolume = BoundsVolume( combinedMins, combinedMaxs );
 	const float unionVolume = ZoneVolume( zoneA.zone ) + ZoneVolume( zoneB.zone ) - ZoneOverlapVolume( zoneA.zone, zoneB.zone );
-	if ( unionVolume <= 0.0f || combinedVolume > unionVolume * kSplitZoneMergeMaxVolumeInflation ) {
+	if ( unionVolume <= 0.0f || combinedVolume > unionVolume * tuning.maximumVolumeInflation ) {
+		return false;
+	}
+
+	// BSP leaves partition open space, so the accumulated leaf volume is how
+	// much of the merged box is actually room rather than solid or a different
+	// room entirely. Without this a long chain of individually cheap merges
+	// ratchets a zone up to the size of the map.
+	const float containedVolume = ( std::max )( 1.0f, zoneA.weight ) + ( std::max )( 1.0f, zoneB.weight );
+	if ( combinedVolume > containedVolume * tuning.maximumFillInflation ) {
 		return false;
 	}
 
 	candidate.a = a;
 	candidate.b = b;
-	candidate.score = minimumCoverage * 2.0f +
-		( ( adjacency.coverageA + adjacency.coverageB ) * 0.5f ) -
-		( combinedVolume / unionVolume - 1.0f );
+	candidate.score = coverage * 3.0f - ( combinedVolume / unionVolume - 1.0f );
 	return true;
 }
 
-static void MergeAdjacentSplitGeneratedZones( std::vector<GeneratedZone> &zones ) {
-	if ( zones.size() < 2u ) {
-		return;
+static void RelinkMergedAdjacency( ZoneAdjacencyGraph &adjacency, std::size_t target, std::size_t source ) {
+	adjacency[target].erase( source );
+	for ( const auto &entry : adjacency[source] ) {
+		const std::size_t other = entry.first;
+		adjacency[other].erase( source );
+		if ( other == target ) {
+			continue;
+		}
+		MergeApertures( adjacency[target][other], entry.second );
+		adjacency[other][target] = adjacency[target][other];
 	}
+	adjacency[source].clear();
+}
 
-	for (;;) {
+// Every round merges all mutually disjoint best-scoring pairs at once, so the
+// zone count falls geometrically instead of one pair per sweep.
+static void MergeAdjacentGeneratedZones( std::vector<GeneratedZone> &zones, ZoneAdjacencyGraph &adjacency, std::vector<bool> &alive, std::size_t &aliveCount, const MergeTuning &tuning, std::size_t limit ) {
+	while ( aliveCount > ( std::max )( std::size_t{ 1 }, limit ) ) {
 		std::vector<SplitMergeCandidate> candidates;
 		for ( std::size_t i = 0; i < zones.size(); ++i ) {
-			for ( std::size_t j = i + 1u; j < zones.size(); ++j ) {
+			if ( !alive[i] ) {
+				continue;
+			}
+			for ( const auto &entry : adjacency[i] ) {
+				if ( entry.first <= i || !alive[entry.first] ) {
+					continue;
+				}
 				SplitMergeCandidate candidate;
-				if ( BuildSplitMergeCandidate( zones, i, j, candidate ) ) {
+				if ( BuildSplitMergeCandidate( zones, i, entry.first, entry.second, tuning, candidate ) ) {
 					candidates.push_back( candidate );
 				}
 			}
@@ -2280,31 +2512,53 @@ static void MergeAdjacentSplitGeneratedZones( std::vector<GeneratedZone> &zones 
 		} );
 
 		std::vector<bool> used( zones.size(), false );
-		std::vector<bool> removed( zones.size(), false );
 		bool mergedAny = false;
 		for ( const SplitMergeCandidate &candidate : candidates ) {
 			if ( used[candidate.a] || used[candidate.b] ) {
 				continue;
 			}
 			MergeGeneratedZoneInto( zones[candidate.a], zones[candidate.b] );
+			RelinkMergedAdjacency( adjacency, candidate.a, candidate.b );
 			used[candidate.a] = true;
 			used[candidate.b] = true;
-			removed[candidate.b] = true;
+			alive[candidate.b] = false;
 			mergedAny = true;
+			if ( --aliveCount <= limit ) {
+				break;
+			}
 		}
 		if ( !mergedAny ) {
 			return;
 		}
-
-		std::vector<GeneratedZone> merged;
-		merged.reserve( zones.size() );
-		for ( std::size_t i = 0; i < zones.size(); ++i ) {
-			if ( !removed[i] ) {
-				merged.push_back( zones[i] );
-			}
-		}
-		zones.swap( merged );
 	}
+}
+
+static void CompactGeneratedZones( std::vector<GeneratedZone> &zones, ZoneAdjacencyGraph &adjacency, const std::vector<bool> &alive ) {
+	std::vector<std::size_t> remap( zones.size(), std::numeric_limits<std::size_t>::max() );
+	std::vector<GeneratedZone> compactZones;
+	compactZones.reserve( zones.size() );
+	for ( std::size_t i = 0; i < zones.size(); ++i ) {
+		if ( alive[i] ) {
+			remap[i] = compactZones.size();
+			compactZones.push_back( zones[i] );
+		}
+	}
+
+	ZoneAdjacencyGraph compactAdjacency( compactZones.size() );
+	for ( std::size_t i = 0; i < zones.size(); ++i ) {
+		if ( remap[i] == std::numeric_limits<std::size_t>::max() ) {
+			continue;
+		}
+		for ( const auto &entry : adjacency[i] ) {
+			if ( remap[entry.first] == std::numeric_limits<std::size_t>::max() ) {
+				continue;
+			}
+			compactAdjacency[remap[i]][remap[entry.first]] = entry.second;
+		}
+	}
+
+	zones.swap( compactZones );
+	adjacency.swap( compactAdjacency );
 }
 
 static GeneratedZone CoarsenGroup( const std::vector<GeneratedZone> &zones, const std::vector<std::size_t> &indices ) {
@@ -2331,171 +2585,134 @@ static std::vector<GeneratedZone> CoarsenGeneratedZonesByKey( const std::vector<
 	return coarsened;
 }
 
-static void AssignGeneratedZoneNames( std::vector<GeneratedZone> &zones ) {
-	std::sort( zones.begin(), zones.end(), []( const GeneratedZone &a, const GeneratedZone &b ) {
-		if ( a.area != b.area ) {
-			return a.area < b.area;
+// Generated priorities are assigned by ascending volume so the tightest zone
+// containing the listener always wins, and no two generated zones ever tie.
+static void AssignGeneratedZoneNames( std::vector<GeneratedZone> &zones, ZoneAdjacencyGraph &adjacency ) {
+	std::vector<std::size_t> order( zones.size() );
+	for ( std::size_t i = 0; i < order.size(); ++i ) {
+		order[i] = i;
+	}
+	std::sort( order.begin(), order.end(), [&zones]( std::size_t a, std::size_t b ) {
+		const float volumeA = ZoneVolume( zones[a].zone );
+		const float volumeB = ZoneVolume( zones[b].zone );
+		if ( volumeA != volumeB ) {
+			return volumeA < volumeB;
 		}
-		if ( a.zone.preset != b.zone.preset ) {
-			return a.zone.preset < b.zone.preset;
+		if ( zones[a].zone.mins.x != zones[b].zone.mins.x ) {
+			return zones[a].zone.mins.x < zones[b].zone.mins.x;
 		}
-		if ( a.cluster != b.cluster ) {
-			return a.cluster < b.cluster;
+		if ( zones[a].zone.mins.y != zones[b].zone.mins.y ) {
+			return zones[a].zone.mins.y < zones[b].zone.mins.y;
 		}
-		return ZoneVolume( a.zone ) < ZoneVolume( b.zone );
+		if ( zones[a].zone.mins.z != zones[b].zone.mins.z ) {
+			return zones[a].zone.mins.z < zones[b].zone.mins.z;
+		}
+		return a < b;
 	} );
+
+	std::vector<std::size_t> remap( zones.size(), 0 );
+	std::vector<GeneratedZone> sorted;
+	sorted.reserve( zones.size() );
+	for ( std::size_t i = 0; i < order.size(); ++i ) {
+		remap[order[i]] = i;
+		sorted.push_back( zones[order[i]] );
+	}
+
+	ZoneAdjacencyGraph sortedAdjacency( zones.size() );
+	for ( std::size_t i = 0; i < zones.size(); ++i ) {
+		for ( const auto &entry : adjacency[i] ) {
+			sortedAdjacency[remap[i]][remap[entry.first]] = entry.second;
+		}
+	}
+	zones.swap( sorted );
+	adjacency.swap( sortedAdjacency );
 
 	for ( std::size_t i = 0; i < zones.size(); ++i ) {
 		const char *presetName = zones[i].zone.preset < static_cast<std::uint32_t>( azfmt::Preset::Count )
 			? azfmt::kPresetNames[zones[i].zone.preset]
 			: "zone";
 		std::ostringstream name;
-		name << "auto-a" << zones[i].area << "-";
-		if ( zones[i].cluster >= 0 ) {
-			name << "c" << zones[i].cluster << "-";
-		}
-		name << presetName << "-" << i;
+		name << "auto-a" << zones[i].area << "-" << presetName << "-" << i;
 		zones[i].zone.name = name.str().substr( 0u, azfmt::kMaxNameBytes );
-		zones[i].zone.priority = GeneratedPriority( zones[i].zone.preset );
+
+		const std::int32_t base = ( zones[i].zone.flags & azfmt::ZoneFlagUnderwater ) != 0
+			? kGeneratedLiquidPriorityBase
+			: kGeneratedPriorityBase;
+		zones[i].zone.priority = base - static_cast<std::int32_t>( i );
 	}
 }
 
-static void CoarsenGeneratedZonesToLimit( std::vector<GeneratedZone> &zones, std::size_t limit ) {
+// Zones start out as BSP leaves, which are fragments of rooms rather than rooms.
+// The quality schedule always runs so that presets are classified from
+// room-scale bounds; the coarsen schedule only runs while the zone count is
+// still over the cap, and each pass relaxes the adjacency bar a little rather
+// than collapsing the map into a handful of map-spanning boxes.
+static void CoarsenGeneratedZonesToLimit( std::vector<GeneratedZone> &zones, ZoneAdjacencyGraph &adjacency, std::size_t limit ) {
+	std::vector<bool> alive( zones.size(), true );
+	std::size_t aliveCount = zones.size();
+	for ( const MergeTuning &tuning : kQualityMergeSchedule ) {
+		MergeAdjacentGeneratedZones( zones, adjacency, alive, aliveCount, tuning, 1u );
+	}
+	for ( const MergeTuning &tuning : kCoarsenMergeSchedule ) {
+		if ( aliveCount <= limit ) {
+			break;
+		}
+		MergeAdjacentGeneratedZones( zones, adjacency, alive, aliveCount, tuning, limit );
+	}
+	CompactGeneratedZones( zones, adjacency, alive );
 	if ( zones.size() <= limit ) {
 		return;
 	}
 
+	// Last resort for pathological maps that stay fragmented even after the
+	// relaxed passes: group by classification, then keep the largest volumes.
 	zones = CoarsenGeneratedZonesByKey( zones, []( const GeneratedZone &zone ) {
 		return std::to_string( zone.area ) + ":" + std::to_string( zone.zone.preset ) + ":" + std::to_string( zone.zone.materialClass );
 	} );
-	if ( zones.size() <= limit ) {
-		return;
+	if ( zones.size() > limit ) {
+		std::sort( zones.begin(), zones.end(), []( const GeneratedZone &a, const GeneratedZone &b ) {
+			return ZoneVolume( a.zone ) > ZoneVolume( b.zone );
+		} );
+		zones.resize( limit );
 	}
-
-	zones = CoarsenGeneratedZonesByKey( zones, []( const GeneratedZone &zone ) {
-		return std::to_string( zone.area ) + ":" + std::to_string( zone.zone.preset );
-	} );
-	if ( zones.size() <= limit ) {
-		return;
-	}
-
-	zones = CoarsenGeneratedZonesByKey( zones, []( const GeneratedZone &zone ) {
-		return std::to_string( zone.zone.preset );
-	} );
-	if ( zones.size() <= limit ) {
-		return;
-	}
-
-	std::sort( zones.begin(), zones.end(), []( const GeneratedZone &a, const GeneratedZone &b ) {
-		return ZoneVolume( a.zone ) > ZoneVolume( b.zone );
-	} );
-	zones.resize( limit );
+	adjacency = BuildLeafAdjacencyGraph( zones, kLeafAdjacencyGapEpsilon );
 }
 
-static bool BuildGeneratedZonesFromBsp( const BspMap &map, std::size_t limit, const std::vector<MaterialOverrideRule> &materialOverrides, std::vector<GeneratedZone> &zones, std::string &error ) {
-	std::map<GeneratedZoneKey, GeneratedZone> accumulators;
+static bool BuildGeneratedZonesFromBsp( const BspMap &map, std::size_t limit, const std::vector<MaterialOverrideRule> &materialOverrides, std::vector<GeneratedZone> &zones, ZoneAdjacencyGraph &adjacency, std::string &error ) {
+	zones.clear();
 	for ( const BspLeaf &leaf : map.leafs ) {
-		if ( !LeafBoundsUsable( leaf ) ) {
+		Vec3 mins;
+		Vec3 maxs;
+		if ( !ClipLeafBounds( map, leaf, mins, maxs ) ) {
 			continue;
 		}
-		const LeafAcoustics acoustics = AnalyzeLeafAcoustics( map, leaf, materialOverrides );
-		const std::uint8_t material = MaterialFromAcoustics( acoustics );
-		GeneratedZoneKey key;
-		key.area = leaf.area;
-		key.cluster = leaf.cluster;
-		key.flags = GeneratedFlagsFromAcoustics( acoustics, material );
-		key.material = ( key.flags & azfmt::ZoneFlagUnderwater ) != 0 ? material : 0;
-
 		GeneratedZone leafZone;
 		leafZone.area = leaf.area;
 		leafZone.cluster = leaf.cluster;
 		leafZone.zone.haveMins = true;
 		leafZone.zone.haveMaxs = true;
-		leafZone.zone.mins = leaf.mins;
-		leafZone.zone.maxs = leaf.maxs;
-		leafZone.zone.materialClass = material;
+		leafZone.zone.mins = mins;
+		leafZone.zone.maxs = maxs;
 		leafZone.weight = ZoneVolume( leafZone.zone );
-		leafZone.acoustics = acoustics;
-		leafZone.materialWeights[material] = leafZone.weight;
+		const Vec3 center = {
+			( mins.x + maxs.x ) * 0.5f,
+			( mins.y + maxs.y ) * 0.5f,
+			( mins.z + maxs.z ) * 0.5f
+		};
+		leafZone.acoustics = AnalyzeLeafAcoustics( map, leaf, center, materialOverrides );
 		FinalizeGeneratedZone( leafZone );
-
-		auto inserted = accumulators.emplace( key, leafZone );
-		if ( !inserted.second ) {
-			MergeGeneratedZoneInto( inserted.first->second, leafZone );
-		}
+		zones.push_back( leafZone );
 	}
 
-	zones.clear();
-	zones.reserve( accumulators.size() );
-	for ( auto &entry : accumulators ) {
-		zones.push_back( entry.second );
-	}
 	if ( zones.empty() ) {
 		error = "BSP did not contain any non-opaque leaf clusters suitable for audio zones";
 		return false;
 	}
 
-	MergeAdjacentSplitGeneratedZones( zones );
-	CoarsenGeneratedZonesToLimit( zones, limit );
-	AssignGeneratedZoneNames( zones );
+	adjacency = BuildLeafAdjacencyGraph( zones, kLeafAdjacencyGapEpsilon );
+	CoarsenGeneratedZonesToLimit( zones, adjacency, limit );
+	AssignGeneratedZoneNames( zones, adjacency );
 	return true;
-}
-
-static bool BuildPortalBetweenZones( const Zone &a, const Zone &b, Portal &aToB, Portal &bToA ) {
-	ZoneAdjacency adjacency;
-	if ( !MeasureZoneAdjacency( a, b, kPortalAdjacencyEpsilon, kPortalAdjacencyEpsilon, adjacency ) ) {
-		return false;
-	}
-
-	Vec3 mins;
-	Vec3 maxs;
-	mins.x = ( std::max )( a.mins.x, b.mins.x );
-	mins.y = ( std::max )( a.mins.y, b.mins.y );
-	mins.z = ( std::max )( a.mins.z, b.mins.z );
-	maxs.x = ( std::min )( a.maxs.x, b.maxs.x );
-	maxs.y = ( std::min )( a.maxs.y, b.maxs.y );
-	maxs.z = ( std::min )( a.maxs.z, b.maxs.z );
-	const int portalAxis = adjacency.axis;
-	if ( portalAxis == 0 ) {
-		const float plane = adjacency.overlap[0] < 0.0f
-			? ( ( a.maxs.x <= b.mins.x ) ? ( a.maxs.x + b.mins.x ) * 0.5f : ( b.maxs.x + a.mins.x ) * 0.5f )
-			: ( ( std::max )( a.mins.x, b.mins.x ) + ( std::min )( a.maxs.x, b.maxs.x ) ) * 0.5f;
-		mins.x = maxs.x = plane;
-	} else if ( portalAxis == 1 ) {
-		const float plane = adjacency.overlap[1] < 0.0f
-			? ( ( a.maxs.y <= b.mins.y ) ? ( a.maxs.y + b.mins.y ) * 0.5f : ( b.maxs.y + a.mins.y ) * 0.5f )
-			: ( ( std::max )( a.mins.y, b.mins.y ) + ( std::min )( a.maxs.y, b.maxs.y ) ) * 0.5f;
-		mins.y = maxs.y = plane;
-	} else {
-		const float plane = adjacency.overlap[2] < 0.0f
-			? ( ( a.maxs.z <= b.mins.z ) ? ( a.maxs.z + b.mins.z ) * 0.5f : ( b.maxs.z + a.mins.z ) * 0.5f )
-			: ( ( std::max )( a.mins.z, b.mins.z ) + ( std::min )( a.maxs.z, b.maxs.z ) ) * 0.5f;
-		mins.z = maxs.z = plane;
-	}
-
-	const float openness = adjacency.overlapArea / ( std::max )( 1.0f, ( std::min )( adjacency.faceAreaA, adjacency.faceAreaB ) );
-	if ( openness < kPortalMinimumOpenness ) {
-		return false;
-	}
-
-	aToB.mins = mins;
-	aToB.maxs = maxs;
-	aToB.openness = ( std::min )( 1.0f, openness );
-	bToA = aToB;
-	return true;
-}
-
-static float PortalBoundsArea( const Portal &portal ) {
-	const float x = ( std::max )( 0.0f, portal.maxs.x - portal.mins.x );
-	const float y = ( std::max )( 0.0f, portal.maxs.y - portal.mins.y );
-	const float z = ( std::max )( 0.0f, portal.maxs.z - portal.mins.z );
-	if ( x <= 0.0f ) {
-		return ( std::max )( 1.0f, y ) * ( std::max )( 1.0f, z );
-	}
-	if ( y <= 0.0f ) {
-		return ( std::max )( 1.0f, x ) * ( std::max )( 1.0f, z );
-	}
-	return ( std::max )( 1.0f, x ) * ( std::max )( 1.0f, y );
 }
 
 struct GeneratedPortalCandidate {
@@ -2506,27 +2723,60 @@ struct GeneratedPortalCandidate {
 	float score = 0.0f;
 };
 
-static void BuildGeneratedPortals( std::vector<Zone> &zones, std::size_t generatedCount ) {
+// Portals come straight from the accumulated open contact between two zones, so
+// a hint only exists where the volumes are genuinely connected, its quad covers
+// the real opening, and its openness is the fraction of the smaller zone's face
+// that is actually open rather than the fraction of two bounding boxes that
+// happen to line up.
+static void BuildGeneratedPortals( std::vector<Zone> &zones, const std::vector<GeneratedZone> &generated, const ZoneAdjacencyGraph &adjacency ) {
+	const std::size_t generatedCount = generated.size();
 	for ( std::size_t i = 0; i < generatedCount; ++i ) {
 		zones[i].portals.clear();
 	}
 
 	std::vector<GeneratedPortalCandidate> candidates;
 	for ( std::size_t i = 0; i < generatedCount; ++i ) {
-		for ( std::size_t j = i + 1u; j < generatedCount; ++j ) {
-			Portal iToJ;
-			Portal jToI;
-			if ( BuildPortalBetweenZones( zones[i], zones[j], iToJ, jToI ) ) {
-				iToJ.targetZone = static_cast<std::uint32_t>( j );
-				jToI.targetZone = static_cast<std::uint32_t>( i );
-				GeneratedPortalCandidate candidate;
-				candidate.a = i;
-				candidate.b = j;
-				candidate.aToB = iToJ;
-				candidate.bToA = jToI;
-				candidate.score = iToJ.openness * PortalBoundsArea( iToJ );
-				candidates.push_back( candidate );
+		for ( const auto &entry : adjacency[i] ) {
+			const std::size_t j = entry.first;
+			if ( j <= i || j >= generatedCount || !entry.second.haveBounds ) {
+				continue;
 			}
+			const float openness = ApertureOpenness( generated, i, j, entry.second );
+			if ( openness < kPortalMinimumOpenness ) {
+				continue;
+			}
+
+			Portal portal;
+			portal.mins = entry.second.mins;
+			portal.maxs = entry.second.maxs;
+			portal.openness = openness;
+
+			// A wide opening bleeds the neighbouring environment further into the
+			// room and starts doing so sooner; a vent-sized gap only matters up
+			// close.
+			const float openingSize = std::sqrt( ( std::max )( 1.0f, static_cast<float>( entry.second.TotalArea() ) ) );
+			portal.blendDistance = ( std::max )( kMinimumGeneratedPortalBlendDistance,
+				( std::min )( kMaximumGeneratedPortalBlendDistance, openingSize * kPortalBlendDistanceScale ) );
+			portal.maximumBlend = kMinimumGeneratedPortalMaxBlend +
+				( kMaximumGeneratedPortalMaxBlend - kMinimumGeneratedPortalMaxBlend ) * openness;
+			portal.minimumBlend = azfmt::kDefaultPortalMinimumBlend;
+			if ( openness >= kWidePortalOpenness ) {
+				portal.blendCurve = static_cast<std::uint8_t>( azfmt::PortalBlendCurve::EaseOut );
+			} else if ( openness <= kNarrowPortalOpenness ) {
+				portal.blendCurve = static_cast<std::uint8_t>( azfmt::PortalBlendCurve::EaseIn );
+			} else {
+				portal.blendCurve = static_cast<std::uint8_t>( azfmt::PortalBlendCurve::Smooth );
+			}
+
+			GeneratedPortalCandidate candidate;
+			candidate.a = i;
+			candidate.b = j;
+			candidate.aToB = portal;
+			candidate.aToB.targetZone = static_cast<std::uint32_t>( j );
+			candidate.bToA = portal;
+			candidate.bToA.targetZone = static_cast<std::uint32_t>( i );
+			candidate.score = openness * static_cast<float>( entry.second.TotalArea() );
+			candidates.push_back( candidate );
 		}
 	}
 
@@ -2646,8 +2896,9 @@ static int FromBspCommand( int argc, char **argv ) {
 	}
 
 	std::vector<GeneratedZone> generatedZones;
+	ZoneAdjacencyGraph generatedAdjacency;
 	const std::size_t generatedLimit = maxZones - overrideZones.size();
-	if ( !BuildGeneratedZonesFromBsp( map, generatedLimit, materialOverrides, generatedZones, error ) ) {
+	if ( !BuildGeneratedZonesFromBsp( map, generatedLimit, materialOverrides, generatedZones, generatedAdjacency, error ) ) {
 		std::cerr << input.string() << ": " << error << "\n";
 		return 1;
 	}
@@ -2669,7 +2920,7 @@ static int FromBspCommand( int argc, char **argv ) {
 		}
 	}
 	zones.insert( zones.end(), overrideZones.begin(), overrideZones.end() );
-	BuildGeneratedPortals( zones, generatedCount );
+	BuildGeneratedPortals( zones, generatedZones, generatedAdjacency );
 
 	const std::vector<std::uint8_t> binary = BuildBinary( zones );
 	if ( binary.size() > azfmt::kMaxFileBytes ) {
@@ -2850,6 +3101,12 @@ static void PrintCountList( const char *label, const char *const *names, const i
 	std::cout << "\n";
 }
 
+// A zone bigger than this share of the sidecar bounds is not a place, it is the
+// map. A zone at or under specificFraction is treated as a specific volume.
+constexpr double kAuditSpanningZoneFraction = 0.50;
+constexpr double kAuditSpecificZoneFraction = 0.10;
+constexpr std::size_t kAuditMinimumZonesForScaleChecks = 8u;
+
 static double ClampAuditScore( double value ) {
 	if ( value < 0.0 ) {
 		return 0.0;
@@ -2964,6 +3221,8 @@ static int AuditCommand( int argc, char **argv ) {
 	float totalVolume = 0.0f;
 	azrt::Vec3f mins = zones.front().mins;
 	azrt::Vec3f maxs = zones.front().maxs;
+	std::vector<double> zoneVolumes;
+	zoneVolumes.reserve( zones.size() );
 
 	for ( std::size_t i = 0; i < zones.size(); ++i ) {
 		const azrt::AudioZone &zone = zones[i];
@@ -2983,6 +3242,7 @@ static int AuditCommand( int argc, char **argv ) {
 			++underwaterFlagCount;
 		}
 		totalVolume += RuntimeZoneVolume( zone );
+		zoneVolumes.push_back( static_cast<double>( RuntimeZoneVolume( zone ) ) );
 		for ( int axis = 0; axis < 3; ++axis ) {
 			mins.v[axis] = ( std::min )( mins.v[axis], zone.mins.v[axis] );
 			maxs.v[axis] = ( std::max )( maxs.v[axis], zone.maxs.v[axis] );
@@ -3026,9 +3286,35 @@ static int AuditCommand( int argc, char **argv ) {
 		}
 	}
 
+	// Zone scale relative to the sidecar bounds. A generated sidecar whose zones
+	// each cover a large share of the map has lost its spatial resolution, which
+	// is exactly what a collapsed coarsening pass produces.
+	const double boundsVolume = ( std::max )( 1.0,
+		static_cast<double>( maxs.v[0] - mins.v[0] ) *
+		static_cast<double>( maxs.v[1] - mins.v[1] ) *
+		static_cast<double>( maxs.v[2] - mins.v[2] ) );
+	std::vector<double> sortedVolumes = zoneVolumes;
+	std::sort( sortedVolumes.begin(), sortedVolumes.end() );
+	const double medianZoneFraction = sortedVolumes.empty() ? 0.0 : sortedVolumes[sortedVolumes.size() / 2u] / boundsVolume;
+	const double maxZoneFraction = sortedVolumes.empty() ? 0.0 : sortedVolumes.back() / boundsVolume;
+	// With N zones a zone would nominally cover 1/N of the map; allow generous
+	// slack so small hand-authored sidecars are not judged by a scale rule aimed
+	// at generated ones.
+	const double specificFraction = ( std::min )( 1.0,
+		( std::max )( kAuditSpecificZoneFraction, 4.0 / static_cast<double>( zones.size() ) ) );
+	int spanningZones = 0;
+	if ( zones.size() >= kAuditMinimumZonesForScaleChecks ) {
+		for ( double volume : zoneVolumes ) {
+			if ( volume / boundsVolume > kAuditSpanningZoneFraction ) {
+				++spanningZones;
+			}
+		}
+	}
+
 	const int axisSamples = ( std::max )( 1, static_cast<int>( std::ceil( std::pow( static_cast<double>( options.samples ), 1.0 / 3.0 ) ) ) );
 	int sampleCount = 0;
 	int zoneHits = 0;
+	int specificHits = 0;
 	int portalBlendHits = 0;
 	double blendSum = 0.0;
 	std::uint64_t checksum = 1469598103934665603ull;
@@ -3045,6 +3331,9 @@ static int AuditCommand( int argc, char **argv ) {
 				const azrt::AudioZone *zone = azrt::FindAudioZone( zones, sample );
 				if ( zone != nullptr ) {
 					++zoneHits;
+					if ( static_cast<double>( RuntimeZoneVolume( *zone ) ) / boundsVolume <= specificFraction ) {
+						++specificHits;
+					}
 					const std::size_t zoneIndex = static_cast<std::size_t>( zone - zones.data() );
 					const azrt::AudioZonePortalBlend blend = azrt::FindAudioZonePortalBlend( zones, *zone, sample );
 					if ( blend.target != nullptr ) {
@@ -3070,8 +3359,14 @@ static int AuditCommand( int argc, char **argv ) {
 	const double portalConfidence = totalPortals == 0
 		? ( generatedCount > 1 ? 0.0 : 1.0 )
 		: ClampAuditScore( 1.0 - static_cast<double>( oneWayPortals + selfPortals ) / static_cast<double>( totalPortals ) );
-	const double lookupConfidence = sampleCount > 0
+	const double lookupCoverage = sampleCount > 0
 		? ClampAuditScore( static_cast<double>( zoneHits ) / static_cast<double>( sampleCount ) )
+		: 0.0;
+	// Coverage alone rewards the wrong thing: a single map-sized box scores 100%.
+	// What matters is that a resolved zone is a specific place rather than the
+	// whole level, so score the share of hits that land in a zone of sane scale.
+	const double lookupConfidence = zoneHits > 0
+		? ClampAuditScore( static_cast<double>( specificHits ) / static_cast<double>( zoneHits ) )
 		: 0.0;
 	const double overlapConfidence = overlapPairs > 0
 		? ClampAuditScore( 1.0 - static_cast<double>( equalPriorityOverlapPairs ) / static_cast<double>( overlapPairs ) )
@@ -3103,6 +3398,9 @@ static int AuditCommand( int argc, char **argv ) {
 	if ( zoneHits == 0 ) {
 		anomalyPenalty += 0.25;
 	}
+	if ( spanningZones > 0 ) {
+		anomalyPenalty += 0.20;
+	}
 	const double anomalyScore = ClampAuditScore( ( 1.0 - overallConfidence ) * 0.75 + anomalyPenalty );
 
 	std::vector<std::string> warnings;
@@ -3127,13 +3425,19 @@ static int AuditCommand( int argc, char **argv ) {
 	if ( zoneHits == 0 ) {
 		warnings.push_back( "deterministic lookup samples did not hit any zone" );
 	}
+	if ( spanningZones > 0 ) {
+		warnings.push_back( "zones cover more than half of the sidecar bounds; generated volumes may have collapsed" );
+	}
 	if ( materialConfidence < 0.35 ) {
 		warnings.push_back( "low material confidence; add material overrides or authored material classes" );
 	}
 	if ( portalConfidence < 0.50 ) {
 		warnings.push_back( "low portal confidence; add reciprocal portals or inspect generated transitions" );
 	}
-	if ( lookupConfidence < 0.80 ) {
+	if ( lookupConfidence < 0.60 ) {
+		warnings.push_back( "most lookups resolve to map-scale zones instead of specific volumes" );
+	}
+	if ( lookupCoverage < 0.10 ) {
 		warnings.push_back( "lookup coverage is low across the sampled sidecar bounds" );
 	}
 	if ( anomalyScore >= 0.50 ) {
@@ -3171,8 +3475,15 @@ static int AuditCommand( int argc, char **argv ) {
 	}
 	std::cout << "overlaps total=" << overlapPairs
 		<< " equalPriority=" << equalPriorityOverlapPairs << "\n";
+	std::cout << "scale boundsVolume=" << boundsVolume
+		<< " medianZoneFraction=" << medianZoneFraction
+		<< " maxZoneFraction=" << maxZoneFraction
+		<< " specificFraction=" << specificFraction
+		<< " spanning=" << spanningZones << "\n";
 	std::cout << "lookup profile samples=" << sampleCount
 		<< " hits=" << zoneHits
+		<< " specificHits=" << specificHits
+		<< " coverage=" << lookupCoverage
 		<< " portalBlends=" << portalBlendHits
 		<< " avgBlend=" << ( portalBlendHits > 0 ? blendSum / portalBlendHits : 0.0 )
 		<< " elapsedMs=" << elapsedMs

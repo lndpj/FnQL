@@ -391,6 +391,7 @@ qboolean vk_capture_liquid_scene( void );
 void vk_get_liquid_mvp( float *mvp );
 void vk_draw_world_cel_outline( void );
 void vk_draw_global_fog( void );
+qboolean vk_draw_underwater( void );
 
 qboolean vk_alloc_vbo( const byte *vbo_data, int vbo_size );
 void vk_update_mvp( const float *m );
@@ -518,6 +519,7 @@ typedef struct {
 		VkRenderPass gamma;
 		VkRenderPass capture;
 		VkRenderPass motion_blur;
+		VkRenderPass underwater;
 		VkRenderPass bloom_extract;
 		VkRenderPass blur[VK_NUM_BLOOM_PASSES*2]; // horizontal-vertical pairs
 		VkRenderPass post_bloom;
@@ -542,6 +544,9 @@ typedef struct {
 	VkImage motion_blur_image;
 	VkImageView motion_blur_image_view;
 	VkDescriptorSet motion_blur_descriptor;
+	VkImage underwater_image;
+	VkImageView underwater_image_view;
+	VkDescriptorSet underwater_descriptor;
 
 	VkImage bloom_image[1+VK_NUM_BLOOM_PASSES*2];
 	VkImageView bloom_image_view[1+VK_NUM_BLOOM_PASSES*2];
@@ -642,6 +647,7 @@ typedef struct {
 		VkFramebuffer liquid_snapshot;
 		VkFramebuffer capture;
 		VkFramebuffer motion_blur;
+		VkFramebuffer underwater;
 		VkFramebuffer dlight_shadow;
 		VkFramebuffer spot_shadow;
 		VkFramebuffer csm_shadow;
@@ -727,6 +733,7 @@ typedef struct {
 		VkShaderModule blur_fs;
 		VkShaderModule blend_fs;
 		VkShaderModule motion_blur_fs;
+		VkShaderModule underwater_fs;
 		VkShaderModule world_outline_fs;
 		VkShaderModule global_fog_fs;
 
@@ -814,6 +821,8 @@ typedef struct {
 	VkPipeline bloom_blend_cel_pipeline;
 	VkPipeline motion_blur_pipeline;
 	VkPipeline motion_blur_copy_pipeline;
+	VkPipeline underwater_pipeline;
+	VkPipeline underwater_copy_pipeline;
 	VkPipeline liquid_snapshot_pipeline;
 	VkPipeline world_outline_pipeline;
 	VkPipeline global_fog_pipeline;

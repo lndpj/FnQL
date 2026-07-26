@@ -63,6 +63,18 @@ user's legitimate Steam installation; they are not inferred from QLSRP:
   process. Starting WebCore and the DataPak source during the existing
   pre-renderer client bootstrap loaded the same package successfully; the
   provisional 1280x720 view then resized to the renderer dimensions.
+- A 2026-07-25 windowed 1920x1080 GLx probe walked the retail settings routes
+  with the section overlay in place. `web_status` reported 97 injected rows in 7
+  groups plus 15 hidden retail rows on Video, 41 rows in 5 groups on Game, 21
+  rows in 2 groups plus 5 hidden rows on Sound, 9 rows in 1 group on Team, 5
+  rows on Input, 3 rows in 1 group on Weapons, and 2 rows plus 2 hidden rows on
+  Basic, with `nanOutputs` zero on every route except the two hidden retail
+  sound sliders. Screenshots showed the retail rows carrying the player's own
+  values rather than defaults.
+- Before the settings snapshot covered them, the retail settings rows read
+  `undefined` from `GetConfig().cvars`: the retail `Cvar` component only falls
+  back to `GetCvar` when its `value` prop is exactly `null`, and the settings
+  component seeds `state.cvars` from the snapshot alone.
 - A 2026-07-19 windowed GLx probe at 2560x1440 showed a complete Awesomium CPU
   surface but an all-black renderer screenshot. The identical launch at
   640x480 presented the CPU surface exactly in the renderer screenshot.
@@ -102,6 +114,32 @@ Windows x86 adapter around the runtime's generated stdcall C exports:
 - no Steamworks success emulation. Unavailable social/online operations remain
   explicit and do not prevent the offline retail menu from rendering.
 
+### Keyboard and text input
+
+The generated C ABI publishes one WebKeyboardEvent constructor,
+`_Awe_new_WebKeyboardEvent_1@12`. Its twelve-byte stdcall frame and overload
+index identify the runtime's Win32 message constructor — `(UINT, WPARAM,
+LPARAM)` — which derives the event type, the typed text, the key identifier,
+and the live modifier state from real message parameters. The runtime exposes
+no constructor taking a type/virtual-key/native-key triple, so passing the
+browser-neutral event type where the message id belongs matches no message
+case: the event stays untyped, its text stays empty, and retail input fields
+such as the Match Browser filter never receive characters even though the page
+composites and responds to the mouse normally.
+
+The adapter therefore presents each event as the message triple Windows itself
+would deliver, rebuilding the lParam — repeat count, layout scancode, extended
+bit, and the previous-state/transition bits of a release — when the caller does
+not assert a specific hardware key.
+
+The browser-neutral contract keeps the two halves separate the way browsers
+do. `KeyDown`/`KeyUp` carry a platform virtual-key code, so the client restores
+retail's Windows virtual keys from the Quake keynums its platform layers
+produced; keynums no keyboard key produces are not forwarded. `Character`
+carries one UTF-16 code unit of already-composed text, delivered ahead of the
+UTF-8 split the legacy modules and edit fields require, with a non-BMP code
+point sent as its surrogate pair.
+
 ### Sparse FnQL settings overlay
 
 FnQL builds and ships `fnql-web.pak`, a deterministic Chromium DataPack v4
@@ -125,26 +163,78 @@ fixture, but the live runtime never replaces the retail navigation document
 with it. This keeps retail bootstrap behavior authoritative while preserving
 the FnQL settings extension.
 
-The settings script appends an FnQL tab after every retail settings tab, making
-it the final item in both visual and keyboard navigation order. The extension
-uses the retail navigation's own `active` class and styling and suppresses the
-underlying route's selected state while the FnQL panel is open, so only one tab
-is presented as active. Leaving or replacing the Settings view clears that
-temporary state instead of reopening a stale FnQL panel later.
+#### Settings placement
 
-The panel builds controls only for cvars present in the engine's allowlisted
-configuration snapshot. This naturally hides renderer- or platform-specific
-controls that are not registered. It also removes the retail Video menu's
-legacy post-processing column and replaces its duplicated mode/fullscreen
-controls; the corresponding FnQL controls own `r_mode`, `r_modeFullscreen`,
-renderer selection, and the supported post-processing cvars.
+Engine-owned controls live in the retail settings section they belong to; there
+is no separate FnQL tab and the retail navigation is left untouched.
 
-The standalone tab is a transitional home for engine-owned controls. Those
-controls should ultimately move into the relevant retail sections: display and
-rendering under Video, player visibility under Team, interface and capture
-under Game, and backend controls under Sound. That migration must remain a
-project-owned sparse overlay rather than copying or modifying the proprietary
-retail bundle; the FnQL tab can be removed once no settings remain in it.
+| Retail section | FnQL content |
+| --- | --- |
+| Input | free look, mouse input source, acceleration style and power, mouse smoothing, appended to the retail Mouse Settings columns |
+| Gamepad | gamepad enable and profile, movement threshold and scale |
+| Basic | windowed and fullscreen resolution, replacing the retail mode rows |
+| Game | interface, console, capture, network, and frame-pacing groups |
+| Team | teammate and opponent highlight color overrides appended to the retail team and enemy columns, plus a Player Highlighting group for the mode, pass intensities, outline thickness, and the red/blue/free colors |
+| Weapons | rail trail geometry |
+| Video | renderer and display in the retail second column, then framebuffer and anti-aliasing, texture and geometry detail, lighting and shadows, color and tone, bloom, scene effects, and cel shading |
+| Sound | unfocused/minimized muting appended to the retail volume column, then audio backend and spatial audio groups |
+
+Rows are built only for cvars present in the engine's allowlisted configuration
+snapshot, so backend-specific controls disappear on their own: the GLx-only
+bloom tuning cvars are absent under Vulkan and RTX, `s_al*` rows are absent
+under the legacy mixer, `s_khz` and `s_mixAhead` only appear under it, and the
+WinMM gamepad rows only appear on Windows. When that set changes the section is
+rebuilt rather than patched, so a `snd_restart` between backends does not leave
+stale rows behind.
+
+Retail rows FnQL cannot honor are hidden rather than left inert: the entire
+legacy post-processing column on Video, its `r_mode`/`r_windowedmode` rows
+because FnQL's video mode table uses different indices, the `r_lightmap`,
+`r_fullbright` and `r_ambientscale` debug/cheat rows, `com_allowconsole`, and
+the `s_announcervolume`, `s_killbeepvolume`, `s_mutebackground` and `s_ambient`
+rows that have no engine lane. Video and Sound carry a short note explaining the
+removal, and take over the retail Apply button so it stays at the end of the
+page.
+
+#### Injection rules
+
+The retail page is React 0.13, which reconciles a container's children by index
+and inserts with `parentNode.childNodes[index]`. Injected nodes are therefore
+only ever appended: at the tail of a retail column, of the section, or of a
+heading. React's own children keep the leading indices its reconciler assumes,
+and an insert at its own child count lands immediately before the first injected
+node, which is the correct position. Inserting ahead of a React child would make
+its later inserts and moves land in the wrong place.
+
+Rows reuse retail's own `.cvar` markup and stylesheet, including its react-select
+DOM. Awesomium's offscreen view does not composite native `<select>` popups,
+which is why retail uses react-select at all, so the overlay reproduces that
+markup and drives it directly rather than using a `<select>` element. The
+project stylesheet only adds what retail has no equivalent for: the hidden-row
+rule, the per-row cvar name, restart tag, and help line, and the section note.
+
+#### Settings snapshot
+
+Both the retail settings component and the overlay read their initial values
+from `GetConfig().cvars` alone; neither falls back to a per-cvar `GetCvar`. A
+cvar missing from the snapshot therefore renders its row with a default instead
+of the player's value, and a truncated snapshot does the same for every row
+after the cut. The allowlist consequently covers the whole settings surface -
+the engine-owned cvars the retail sections bind rows to, the archived
+cgame-owned rows, and the FnQL rows - the buffer is sized for it, and a
+truncation prints a developer diagnostic naming the cvar it stopped at.
+`tests/webui_settings_overlay_tests.py` keeps the overlay, the allowlist, and
+the engine's registrations from drifting apart.
+
+Browser-originated cvar writes are refused for `CVAR_PRIVATE` and `CVAR_ROM`.
+`CVAR_PROTECTED` is deliberately writable: it marks Quake Live engine-managed
+cvars, several of which the retail settings page owns - `r_windowedMode`,
+`m_cpi`, `cl_mouseAccel`, `cl_mouseAccelOffset`, `cl_mouseAccelPower`,
+`cl_allowConsoleChat`, `cl_demoRecordMessage`, `cl_timeNudge`, `com_maxfps` -
+and `Cvar_WriteVariables` routes exactly that flag to `repconfig.cfg`. Refusing
+those writes left the corresponding rows present and inert, and the flag never
+provided a boundary here because a page can already run console commands through
+the `cmd` request.
 
 Build systems generate the sidecar alongside the executable, and the runtime
 checks the executable directory first so VS Code/Meson build trees discover it
@@ -196,6 +286,36 @@ the legacy `(key | K_CHAR_FLAG, down, time)` tuple to retail's observed
 `(key, characterEvent, down)` ABI. Passing the timestamp as retail's `down`
 argument makes Escape's key-up close the menu immediately after it opens.
 
+`KEYCATCH_UI` is claimed unconditionally once `UI_SET_ACTIVE_MENU` has been
+sent, as retail does. It must not be made conditional on the module's own
+`UI_MENUS_ANY_VISIBLE` menu-stack query: that slot was recovered from
+`uix86.dll` without a signature and is only established for the fullscreen main
+menu while disconnected, which is the only place the engine consumes it
+(`CL_UIMenusAreVisible`). The in-game menu's draw pass in `SCR_DrawScreenField`,
+its absolute-pointer cursor, and its mouse grab all key off that catcher bit, so
+gating the claim on an unestablished predicate removes the in-game menu
+entirely. Confirming the slot's retail semantics is a prerequisite for any
+verification built on it.
+
+`KEYCATCH_BROWSER` is different: it is engine-owned, and
+`CL_WebHost_HasDrawableSurface` is the same predicate that already decides
+whether the overlay is drawn and whether it owns input. Escape therefore stays
+with the browser only while it can actually present a surface; a claim that
+outlived its surface is released rather than swallowing the key.
+
+That in-game menu routes its Main Menu and Settings buttons back to the WebUI:
+retail `ui/ingame.menu` runs `exec "web_changeHash /"` and
+`exec "web_changeHash /settings"` before opening the native `ingame_about`
+page, so the route is carried entirely by the browser verb. Because the
+connection transition already paused rendering and unfocused the retained
+document, changing its hash is not sufficient to present it again. A paused
+view keeps compositing the last pre-game bitmap -- the main menu route, which
+made Settings look like it opened the main menu -- and an unfocused Awesomium
+view discards the injected mouse and key events the overlay is already
+receiving, so the presented menu accepted no clicks. Both verbs therefore
+resume rendering and restore focus on the retained document before claiming the
+overlay, and fall through to the navigating path when that fails.
+
 ## Safety and non-regression
 
 - Privileged navigation remains locked to `asset://ql/`.
@@ -206,7 +326,9 @@ argument makes Escape's key-up close the menu immediately after it opens.
 - A missing, incompatible, or crashed browser yields to the native UI instead
   of making the engine unusable.
 - `web_status` reports bounded document/backend state and `web_dumpSurface`
-  captures the copied CPU bitmap for renderer-independent diagnosis.
+  captures the copied CPU bitmap for renderer-independent diagnosis. Its
+  `fnqlRows`, `fnqlGroups`, and `fnqlHiddenRetailRows` counters report what the
+  settings overlay actually placed in the live document.
 - `FNQL_WEBUI_VERBOSE_LOG=1` enables the retail runtime's verbose log level for
   an explicit diagnostic launch; normal launches retain the runtime default.
 - The typed fake-backend suite continues to cover interface mismatch, lifecycle,

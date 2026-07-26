@@ -1,7 +1,7 @@
 {
   "schema": "q3rtx.rendererrtx.shader_reflection.v1",
   "generator": "code/rendererrtx/shaders/build_shaders.py",
-  "shader_count": 87,
+  "shader_count": 88,
   "shaders": [
     {
       "symbol": "color_vert_spv",
@@ -436,6 +436,39 @@
           {
             "name": "pc",
             "size_bytes": 32
+          }
+        ]
+      }
+    },
+    {
+      "symbol": "underwater_frag_spv",
+      "source": "underwater.frag",
+      "stage": "frag",
+      "defines": [],
+      "byte_size": 4960,
+      "reflection": {
+        "descriptor_bindings": [
+          {
+            "name": "scene_color",
+            "set": 0,
+            "binding": 0,
+            "storage_class": "UniformConstant",
+            "descriptor_class": "combined_image_sampler",
+            "descriptor_count": 1
+          },
+          {
+            "name": "scene_depth",
+            "set": 1,
+            "binding": 0,
+            "storage_class": "UniformConstant",
+            "descriptor_class": "combined_image_sampler",
+            "descriptor_count": 1
+          }
+        ],
+        "push_constants": [
+          {
+            "name": "pc",
+            "size_bytes": 128
           }
         ]
       }

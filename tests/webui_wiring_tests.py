@@ -100,6 +100,35 @@ class WebUiWiringTests(unittest.TestCase):
         self.assertIn('CL_WebUI_ReportUnavailable( "web_browserActive" );', browser_active)
         self.assertIn("CL_WebHost_HideBrowser();", browser_active)
 
+    def test_ingame_hash_change_resumes_the_retained_document(self) -> None:
+        """Retail's in-game Escape menu reaches the already-loaded WebUI with
+        `web_changeHash`. A game transition left that view paused and unfocused,
+        so the route change alone would keep presenting the pre-game bitmap and
+        Awesomium would discard every injected mouse and key event."""
+
+        source = (ROOT / "code" / "client" / "cl_webui.cpp").read_text(encoding="utf-8")
+
+        resume = source[
+            source.index("static qboolean CL_WebHost_ResumeRetainedDocument"):
+            source.index("static qboolean CL_WebHost_SetLocationHash")
+        ]
+        self.assertIn("host.SetRenderingPaused( false )", resume)
+        self.assertIn("host.SetFocus( true )", resume)
+        self.assertIn("if ( !host.IsRunning() ) {", resume)
+
+        opener = source[
+            source.index("static qboolean CL_WebHost_OpenRequestedURL"):
+            source.index("static void CL_Web_ShowBrowser_f")
+        ]
+        self.assertIn(
+            "&& CL_WebHost_SetLocationHash( requestedUrl )\n"
+            "\t\t\t&& CL_WebHost_ResumeRetainedDocument() ) {",
+            opener,
+        )
+        # A failed resume must fall through to the navigating path, which
+        # re-opens the URL and unpauses there, rather than reporting success.
+        self.assertIn("CL_Awesomium_OpenURL( cl_webui.currentUrl )", opener)
+
     def test_client_and_common_lifecycle_hooks_are_wired(self) -> None:
         client = (ROOT / "code" / "client" / "cl_main.cpp").read_text(encoding="utf-8")
         common = (ROOT / "code" / "qcommon" / "common.c").read_text(encoding="utf-8")
@@ -165,7 +194,7 @@ class WebUiWiringTests(unittest.TestCase):
         self.assertIn("CL_WebView_OnMouseButtonEvent( key, down );", keys)
         self.assertIn("CL_WebView_OnMouseWheelEvent( 1 );", keys)
         self.assertIn("fnql::input::EncodeUtf8( *codepoint )", keys)
-        self.assertIn("CL_WebView_OnKeyEvent( utf8Byte | K_CHAR_FLAG, qtrue );", keys)
+        self.assertIn("CL_WebView_OnCharEvent( static_cast<int>( *codepoint ) );", keys)
         self.assertIn("Key_GetCatcher( ) & KEYCATCH_BROWSER", keys)
         self.assertIn("CL_WebView_OnMouseMove( dx, dy );", input_source)
         self.assertIn("CL_AdvertisementBridge_IsDelayElapsed()", input_source)
@@ -544,7 +573,11 @@ class WebUiWiringTests(unittest.TestCase):
         self.assertIn('strstr( requestedUrl, "://" )', source)
         self.assertIn("Q_strncpyz( cl_webui.currentUrl, requestedUrl, sizeof( cl_webui.currentUrl ) );", source)
         self.assertIn("relativeUrl = strstr( requestedUrl, \"://\" ) ? qfalse : qtrue;", source)
-        self.assertIn("CL_WebHost_HasLiveView() && CL_WebHost_HasBoundWindowObject() && CL_WebHost_SetLocationHash( requestedUrl )", source)
+        self.assertIn(
+            "CL_WebHost_HasLiveView() && CL_WebHost_HasBoundWindowObject()\n"
+            "\t\t\t&& CL_WebHost_SetLocationHash( requestedUrl )",
+            source,
+        )
         self.assertIn("CL_WebHost_NormalizeHash( requestedUrl, cl_webui.pendingHash", source)
         self.assertIn('CL_WebUI_ReportUnavailable( owner ? owner : "qz.OpenURL" );', source)
         self.assertIn("qboolean CL_Steam_OpenOverlayUrl( const char *url );", client_header)
@@ -973,7 +1006,21 @@ class WebUiWiringTests(unittest.TestCase):
         client_header = (ROOT / "code" / "client" / "client.h").read_text(encoding="utf-8")
 
         self.assertIn("#define CL_WEB_CONFIG_SYNC_FRAMES 300", source)
-        self.assertIn("#define CL_WEB_CONFIG_JSON_LENGTH 8192", source)
+        self.assertIn("#define CL_WEB_CONFIG_CVAR_JSON_LENGTH 32768", source)
+        self.assertIn("#define CL_WEB_CONFIG_BIND_JSON_LENGTH 8192", source)
+        self.assertIn(
+            "#define CL_WEB_CONFIG_JSON_LENGTH \\\n"
+            "\t( CL_WEB_CONFIG_CVAR_JSON_LENGTH + CL_WEB_CONFIG_BIND_JSON_LENGTH + 4096 )",
+            source,
+        )
+        # The snapshot is heap-allocated: it is built on a per-frame path and now
+        # carries the whole settings surface.
+        self.assertIn(
+            "char *cvarJson = static_cast<char *>( Z_Malloc( CL_WEB_CONFIG_CVAR_JSON_LENGTH ) );",
+            source,
+        )
+        self.assertNotIn("char configJson[CL_WEB_CONFIG_JSON_LENGTH]", source)
+        self.assertIn("WebUI settings snapshot truncated at", source)
         self.assertIn("qboolean\tconfigSnapshotSynced;", source)
         self.assertIn("qboolean\tdemoSnapshotSynced;", source)
         self.assertIn("static void CL_WebHost_BuildConfigJson", source)
@@ -1006,7 +1053,9 @@ class WebUiWiringTests(unittest.TestCase):
         self.assertIn("CL_WebUI_RequestSteamAvatarPng( path, &buffer, &length )", source)
         self.assertIn('Com_sprintf( buffer, bufferSize, "https://steamcommunity.com/profiles/%s", steamId );', source)
         self.assertIn("static void CL_Steam_GetLocalDisplayName", source)
-        self.assertIn("status.persona_name", source)
+        # The persona reaches the UI through the published identity so
+        # qz_instance.playerName matches the name userinfo carries.
+        self.assertIn("identity = CL_SteamIdentityName();", source)
         self.assertIn("CL_Steam_GetLocalDisplayName( playerName, sizeof( playerName ) );", source)
         self.assertIn('Cvar_VariableStringBuffer( "fs_steampath", retailPath', source)
         self.assertIn('\\"playerAvatar\\":\\"%s\\"', source)
@@ -1140,12 +1189,11 @@ class WebUiWiringTests(unittest.TestCase):
         self.assertIn("#define CL_WEB_KEYBOARD_EVENT_ACTIVATION_TYPE 0u", source)
         self.assertIn("#define CL_WEB_KEYBOARD_EVENT_ACTIVATION_VIRTUAL_KEY 0x11u", source)
         self.assertIn("#define CL_WEB_KEYBOARD_EVENT_ACTIVATION_NATIVE_KEY 0x1d0001L", source)
-        self.assertIn("if ( !down && cl_webui.keyCaptureArmed && !( key & K_CHAR_FLAG ) )", source)
+        self.assertIn("if ( !down && cl_webui.keyCaptureArmed )", source)
         self.assertIn("CL_WebView_PublishGameKey( key );", source)
         self.assertIn("cl_webui.keyCaptureArmed = qfalse;", source)
-        self.assertIn("CL_Awesomium_InjectKeyboardEvent( CL_WEB_KEYBOARD_EVENT_CHAR_TYPE, (unsigned int)( key & ~K_CHAR_FLAG ), 0 );", source)
         self.assertIn("down ? CL_WEB_KEYBOARD_EVENT_KEYDOWN_TYPE : CL_WEB_KEYBOARD_EVENT_KEYUP_TYPE", source)
-        self.assertIn("(unsigned int)key,\n\t\t\t\t0 );", source)
+        self.assertIn("virtualKey,\n\t\t\t0 );", source)
         self.assertIn("static void CL_WebView_InjectActivationKeyboardEvent( void )", source)
         self.assertIn("if ( cl_webui.browserVisible || cl_webui.browserActive )", source)
         self.assertIn("CL_WEB_KEYBOARD_EVENT_ACTIVATION_TYPE,\n\t\t\tCL_WEB_KEYBOARD_EVENT_ACTIVATION_VIRTUAL_KEY,\n\t\t\tCL_WEB_KEYBOARD_EVENT_ACTIVATION_NATIVE_KEY", source)
@@ -1156,6 +1204,53 @@ class WebUiWiringTests(unittest.TestCase):
         self.assertIn("cl_webui.appActive = active;", notify_activation)
         self.assertIn("if ( !active )", notify_activation)
         self.assertIn("CL_WebView_InjectActivationKeyboardEvent();", notify_activation)
+
+    def test_browser_text_input_uses_virtual_keys_and_composed_characters(self) -> None:
+        source = (ROOT / "code" / "client" / "cl_webui.cpp").read_text(encoding="utf-8")
+        keys = (ROOT / "code" / "client" / "cl_keys.cpp").read_text(encoding="utf-8")
+        header = (ROOT / "code" / "client" / "client.h").read_text(encoding="utf-8")
+
+        self.assertIn("void CL_WebView_OnCharEvent( int codepoint );", header)
+        self.assertIn("static unsigned int CL_WebHost_MapVirtualKey( int key )", source)
+        self.assertIn("return (unsigned int)( key - 'a' ) + 0x41u;", source)
+        self.assertIn("return (unsigned int)( key - '0' ) + 0x30u;", source)
+        self.assertIn("return (unsigned int)( key - K_F1 ) + 0x70u;", source)
+        for keynum, virtual_key in (
+            ("K_BACKSPACE", "0x08u"),
+            ("K_ESCAPE", "0x1bu"),
+            ("K_LEFTARROW", "0x25u"),
+            ("K_DEL", "0x2eu"),
+            ("K_KP_INS", "0x60u"),
+            ("K_SEMICOLON", "0xbau"),
+        ):
+            with self.subTest(keynum=keynum):
+                self.assertRegex(
+                    source, rf"case {keynum}:\s+return {virtual_key};"
+                )
+
+        key_event = source[
+            source.index("void CL_WebView_OnKeyEvent"):
+            source.index("void CL_WebView_OnCharEvent")
+        ]
+        self.assertIn("if ( key & K_CHAR_FLAG )", key_event)
+        self.assertIn("virtualKey = CL_WebHost_MapVirtualKey( key );", key_event)
+        self.assertIn("if ( virtualKey == 0u )", key_event)
+        self.assertNotIn("(unsigned int)key", key_event)
+
+        char_event = source[source.index("void CL_WebView_OnCharEvent"):]
+        char_event = char_event[: char_event.index("qboolean CL_Awesomium_RequestResource")]
+        self.assertIn("scalar > 0x10ffffu || ( scalar >= 0xd800u && scalar <= 0xdfffu )", char_event)
+        self.assertIn("0xd800u + ( supplementary >> 10 ), 0 );", char_event)
+        self.assertIn("0xdc00u + ( supplementary & 0x3ffu ), 0 );", char_event)
+        self.assertIn(
+            "CL_Awesomium_InjectKeyboardEvent( CL_WEB_KEYBOARD_EVENT_CHAR_TYPE, scalar, 0 );",
+            char_event,
+        )
+
+        # The browser must be served the decoded code point, never the UTF-8
+        # byte stream the legacy consumers below it expect.
+        self.assertIn("CL_WebView_OnCharEvent( static_cast<int>( *codepoint ) );", keys)
+        self.assertNotIn("CL_WebView_OnKeyEvent( utf8Byte | K_CHAR_FLAG, qtrue );", keys)
 
     def test_browser_input_bridge_maps_mouse_buttons_and_requires_active_browser(self) -> None:
         source = (ROOT / "code" / "client" / "cl_webui.cpp").read_text(encoding="utf-8")

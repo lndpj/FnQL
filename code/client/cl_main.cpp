@@ -33,6 +33,7 @@ extern "C" {
 #include "window_resize.hpp"
 #include "../qcommon/protocol_contract.hpp"
 #include "../qcommon/netchan_safety.hpp"
+#include "../qcommon/steam_identity.hpp"
 #include "../platform/fnql_steam.h"
 
 #include <algorithm>
@@ -213,6 +214,7 @@ cvar_t	*cl_activeAction;
 
 cvar_t	*cl_motdString;
 static cvar_t *cl_platform;
+static cvar_t *cl_steamNameLock;
 
 cvar_t	*cl_allowDownload;
 #ifdef USE_CURL
@@ -1495,6 +1497,9 @@ void CL_MapLoading( void ) {
 		clc.connectTime = -RETRANSMIT_TIMEOUT;
 		NET_StringToAdr( cls.servername, &clc.serverAddress, NA_UNSPEC );
 		CL_WebView_PublishGameStartForAddress( &clc.serverAddress );
+		// this path sends userinfo without waiting for the next frame, so assert
+		// the Steam identity before it is captured into the connect request
+		CL_EnforceSteamIdentity();
 		// we don't need a challenge on the localhost
 		CL_CheckForResend();
 	}
@@ -3933,6 +3938,181 @@ qboolean CL_NoDelay( void )
 
 
 /*
+===============================================================================
+
+RETAIL STEAM PLAYER IDENTITY
+
+Retail Quake Live registers "name" with the "UnnamedPlayer" default and owns the
+value from there. It never persists one: "name" appears in neither retail-written
+config, while every other userinfo key does, so the identity is re-derived each
+session. "country" is persisted, into the replicated config rather than the
+hardware one, which makes it an engine publication of the Steam account country
+instead of a preference.
+
+The retail web UI has no rename control: its only identity reference is the
+read-only qz_instance.playerName, and SetCvar() is used solely for "password",
+"net_port", "bot_minplayers", and "sv_serverType". A rename is therefore a Steam
+profile action, and the engine keeps the published identity matching the persona.
+
+FnQL still has a console and can run non-retail modules, so the identity is
+re-asserted rather than assumed: a write that drifts away from the persona is
+reverted before the userinfo update leaves the client, and the reason is printed
+once per rejected value. \cl_steamNameLock 0 is a documented FnQL extension for
+provider-free and mod setups; the lock is inert without a Steam identity.
+
+===============================================================================
+*/
+
+namespace {
+
+struct SteamIdentityState {
+	std::array<char, MAX_NAME_LENGTH> name{};
+	std::array<char, 3> country{};
+	std::array<char, MAX_NAME_LENGTH> rejected{};
+	bool available = false;    // a Steam persona currently owns "name"
+	bool synced = false;       // the resolved identity reached the cvars
+	bool announced = false;    // the resolved identity was printed once
+	uint32_t nextStatusPoll = 0;
+};
+
+SteamIdentityState steamIdentity;
+
+/*
+Re-read the provider identity. Returns true when the persona changed the value
+that "name" has to carry.
+*/
+qboolean CL_ReadSteamIdentity( void ) {
+	fnqlSteamStatus_t status = {};
+	std::array<char, MAX_NAME_LENGTH> name{};
+	std::array<char, 3> country{};
+	const qboolean locked = CL_SteamIdentityNameLocked();
+	bool available = false;
+
+	status.size = sizeof( status );
+	if ( locked && FNQL_Steam_Available( FNQL_STEAM_CAP_IDENTITY )
+		&& FNQL_Steam_GetStatus( &status ) && status.local_steam_id != 0 ) {
+		const fnql::identity::NameNormalization normalized =
+			fnql::identity::NormalizePersonaName( status.persona_name,
+				name.data(), name.size() );
+		if ( !normalized.usable ) {
+			// A persona that normalizes away still identifies a signed-in
+			// account, so publish the retail default instead of a local value.
+			Q_strncpyz( name.data(), fnql::identity::kUnnamedPlayer,
+				static_cast<int>( name.size() ) );
+		}
+		fnql::identity::NormalizeCountryCode( status.country,
+			country.data(), country.size() );
+		available = true;
+	}
+
+	const bool changed = available != steamIdentity.available
+		|| strcmp( name.data(), steamIdentity.name.data() ) != 0
+		|| strcmp( country.data(), steamIdentity.country.data() ) != 0;
+
+	steamIdentity.available = available;
+	steamIdentity.name = name;
+	steamIdentity.country = country;
+	if ( changed ) {
+		steamIdentity.rejected[0] = '\0';
+		steamIdentity.synced = false;
+	}
+	return ToQboolean( changed );
+}
+
+/*
+Publish the resolved identity, reverting a local write that drifted away from
+it. Retail never surfaces a rename attempt because it has no rename control, so
+the explanation is bounded to one print per distinct rejected value.
+*/
+void CL_PublishSteamIdentity( void ) {
+	if ( !steamIdentity.available ) {
+		return;
+	}
+
+	const char *published = Cvar_VariableString( "name" );
+	if ( strcmp( published, steamIdentity.name.data() ) != 0 ) {
+		// Adopting the identity is silent: the archived value, a persona edit,
+		// and an account change all reach this path legitimately. Only a write
+		// that lands after the identity was already published is a rename
+		// attempt, and the reason is printed once per distinct value so a
+		// module retrying every frame cannot flood the console.
+		if ( steamIdentity.synced && published[0] != '\0'
+			&& Q_strncmp( published, steamIdentity.rejected.data(),
+				static_cast<int>( steamIdentity.rejected.size() ) - 1 ) != 0 ) {
+			Q_strncpyz( steamIdentity.rejected.data(), published,
+				static_cast<int>( steamIdentity.rejected.size() ) );
+			Com_Printf( "Your player name follows your Steam profile name."
+				" Rename through Steam, or set \\cl_steamNameLock 0 to manage"
+				" \\name locally.\n" );
+		}
+		Cvar_Set2( "name", steamIdentity.name.data(), qtrue );
+	}
+	if ( strcmp( Cvar_VariableString( "country" ),
+		steamIdentity.country.data() ) != 0 ) {
+		Cvar_Set2( "country", steamIdentity.country.data(), qtrue );
+	}
+	steamIdentity.synced = true;
+}
+
+} // namespace
+
+const char *CL_SteamIdentityName( void ) {
+	return steamIdentity.available ? steamIdentity.name.data() : "";
+}
+
+qboolean CL_SteamIdentityNameLocked( void ) {
+	return cl_steamNameLock == NULL || cl_steamNameLock->integer != 0
+		? qtrue : qfalse;
+}
+
+/*
+==================
+CL_RefreshSteamIdentity
+
+Resolve the identity from the provider and publish it. Called once the client
+cvars exist and again whenever the account or persona can have changed.
+==================
+*/
+void CL_RefreshSteamIdentity( void ) {
+	const qboolean changed = CL_ReadSteamIdentity();
+
+	CL_PublishSteamIdentity();
+	if ( !steamIdentity.available ) {
+		steamIdentity.announced = false;
+		return;
+	}
+	if ( changed || !steamIdentity.announced ) {
+		steamIdentity.announced = true;
+		Com_DPrintf( "Steam identity published: name \"%s\", country \"%s\".\n",
+			steamIdentity.name.data(),
+			steamIdentity.country[0] ? steamIdentity.country.data()
+				: "unavailable" );
+	}
+}
+
+/*
+==================
+CL_EnforceSteamIdentity
+
+Per-frame identity assertion. The drift check is a string compare against the
+resolved persona; the provider itself is re-read on a bounded interval so a
+persona edit or an account transition is picked up without a callback.
+==================
+*/
+void CL_EnforceSteamIdentity( void ) {
+	const uint32_t now = static_cast<uint32_t>( Sys_Milliseconds() );
+
+	if ( !steamIdentity.nextStatusPoll
+		|| static_cast<int32_t>( now - steamIdentity.nextStatusPoll ) >= 0 ) {
+		steamIdentity.nextStatusPoll = now + 1000u;
+		CL_RefreshSteamIdentity();
+		return;
+	}
+	CL_PublishSteamIdentity();
+}
+
+
+/*
 ==================
 CL_CheckUserinfo
 ==================
@@ -4136,6 +4316,10 @@ void CL_Frame( int msec, int realMsec ) {
 	if ( cl_timegraph->integer ) {
 		SCR_DebugGraph( realMsec * 0.25f );
 	}
+
+	// keep the published identity matching the Steam persona before any
+	// userinfo update or connection request leaves the client
+	CL_EnforceSteamIdentity();
 
 	// see if we need to update any userinfo
 	CL_CheckUserinfo();
@@ -4998,7 +5182,12 @@ static void CL_InitGLimp_Cvars( void )
 	r_glDriver = Cvar_Get( "r_glDriver", OPENGL_DRIVER_NAME, CVAR_ARCHIVE_ND | CVAR_LATCH );
 	Cvar_SetDescription( r_glDriver, "Specifies the OpenGL driver to use, will revert back to default if driver name set is invalid." );
 
-	r_displayRefresh = Cvar_Get( "r_displayRefresh", "0", CVAR_LATCH );
+	// Quake Live archives the fullscreen refresh override and replicates it with
+	// the rest of the video profile (QLSRP registers it CVAR_ARCHIVE | CVAR_LATCH
+	// | CVAR_CLOUD). The retail Video menu offers the row, so an unarchived cvar
+	// silently dropped the choice on the next launch.
+	r_displayRefresh = Cvar_Get( "r_displayRefresh", "0",
+		CVAR_ARCHIVE_ND | CVAR_LATCH | CVAR_CLOUD );
 	Cvar_CheckRange( r_displayRefresh, "0", "500", CV_INTEGER );
 	Cvar_SetDescription( r_displayRefresh, "Override monitor refresh rate in fullscreen mode:\n   0 - use current monitor refresh rate\n > 0 - use custom refresh rate" );
 
@@ -5334,7 +5523,19 @@ void CL_Init( void ) {
 	cl_reconnectArgs = Cvar_Get( "cl_reconnectArgs", "", CVAR_ARCHIVE_ND | CVAR_NOTABCOMPLETE );
 
 	// userinfo
-	Cvar_Get ("name", "UnnamedPlayer", CVAR_USERINFO | CVAR_ARCHIVE_ND );
+	Cvar_Get ("name", fnql::identity::kUnnamedPlayer,
+		CVAR_USERINFO | CVAR_ARCHIVE_ND );
+	// Retail publishes the Steam account country alongside the persona name and
+	// archives it, so a profile config carries both identity keys.
+	Cvar_SetDescription( Cvar_Get( "country", "",
+		CVAR_USERINFO | CVAR_ARCHIVE_ND | CVAR_PROTECTED ),
+		"Steam account country code published in userinfo; empty without a Steam identity." );
+	cl_steamNameLock = Cvar_Get( "cl_steamNameLock", "1", CVAR_ARCHIVE_ND );
+	Cvar_CheckRange( cl_steamNameLock, "0", "1", CV_INTEGER );
+	Cvar_SetDescription( cl_steamNameLock,
+		"Keep \\name matching the signed-in Steam persona like retail Quake Live:\n"
+		" 0 - manage \\name locally (FnQL extension)\n"
+		" 1 - the Steam profile name owns \\name and reverts local writes" );
 	Cvar_Get ("rate", "25000", CVAR_USERINFO | CVAR_ARCHIVE );
 	Cvar_Get ("snaps", "40", CVAR_USERINFO | CVAR_ARCHIVE );
 	Cvar_Get ("model", "sarge", CVAR_USERINFO | CVAR_ARCHIVE_ND );
@@ -5352,6 +5553,10 @@ void CL_Init( void ) {
 
 	Cvar_Get ("password", "", CVAR_USERINFO | CVAR_NORESTART);
 	Cvar_Get ("cg_predictItems", "1", CVAR_USERINFO | CVAR_ARCHIVE );
+
+	// FNQL_Steam_Init() already ran, so a signed-in persona takes ownership of
+	// the identity keys before any archived value can reach a server.
+	CL_RefreshSteamIdentity();
 
 
 	// cgame might not be initialized before menu is used

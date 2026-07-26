@@ -316,7 +316,13 @@ int Key_StringToKeynum( const char *str ) {
 		return -1;
 	}
 	if ( str[1] == '\0' ) {
-		return str[0];
+		// Key events deliver printable keys as lowercased ASCII, so a
+		// single-character key name has to be folded the same way. Retail
+		// Quake Live lowercases here as well; returning the raw character
+		// would accept "bind A" and store it on keynum 'A', which no input
+		// path can ever produce. Use locase[] rather than tolower() so the
+		// mapping stays locale independent.
+		return locase[ (byte)str[0] ];
 	}
 
 	if ( !Q_stricmp( str, "PAD0_A" ) )
@@ -369,7 +375,10 @@ const char *Key_KeynumToString( int keynum ) {
 	}
 
 	// check for printable ascii (don't use quote)
-	if ( keynum > ' ' && keynum < '~' && keynum != '"' && keynum != ';' ) {
+	// Retail Quake Live emits the whole printable range here, tilde included,
+	// so '~' round-trips as "~" instead of falling through to the "0x7e" hex
+	// form. Both spellings still parse back to the same keynum.
+	if ( keynum > ' ' && keynum < 127 && keynum != '"' && keynum != ';' ) {
 		tinystr[0] = keynum;
 		tinystr[1] = '\0';
 		return tinystr;

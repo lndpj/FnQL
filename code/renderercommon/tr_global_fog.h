@@ -43,6 +43,54 @@ static ID_INLINE void R_GlobalFogClear( globalFog_t *fog )
 }
 
 
+static ID_INLINE float R_GlobalFogSrgbToLinear( float value )
+{
+	if ( value <= 0.0f ) {
+		return 0.0f;
+	}
+	if ( value <= 0.04045f ) {
+		return value / 12.92f;
+	}
+	if ( value < 1.0f ) {
+		return powf( ( value + 0.055f ) / 1.055f, 2.4f );
+	}
+	return 1.0f;
+}
+
+
+/*
+====================
+R_GlobalFogSceneColor
+
+Sidecar colors are authored as display-referred values, but the compositor
+blends into the scene color buffer, which the final output transform still
+scales by the overbright factor (and by the tone-map exposure in scene-linear
+mode).  Convert the authored color into that pre-output domain first;
+otherwise an authored mid-grey reaches the display at twice its brightness and
+the layer reads as a uniform wash instead of distance fog.
+
+outputScale is the multiplier the output transform will apply.  sceneLinear
+selects the linear-light scene buffer, where the authored sRGB value has to be
+linearized as well.
+====================
+*/
+static ID_INLINE void R_GlobalFogSceneColor( const globalFog_t *fog,
+	float outputScale, qboolean sceneLinear, vec3_t out )
+{
+	float scale;
+	int i;
+
+	if ( !fog || !out ) {
+		return;
+	}
+	scale = ( outputScale > 0.0f ) ? 1.0f / outputScale : 1.0f;
+	for ( i = 0; i < 3; i++ ) {
+		const float authored = fog->color[i];
+		out[i] = ( sceneLinear ? R_GlobalFogSrgbToLinear( authored ) : authored ) * scale;
+	}
+}
+
+
 static ID_INLINE qboolean R_GlobalFogWhitespace( unsigned char c )
 {
 	return ( c == ' ' || c == '\t' || c == '\r' || c == '\n' ||

@@ -471,6 +471,14 @@ bool ForwardsTypedNavigationScriptAndInput() {
 		'A', 0x1e0001 } ) );
 	CHECK( fake.keyboardCount == 1 );
 	CHECK( fake.lastKeyboard.virtualKey == 'A' );
+	CHECK( host.InjectKeyboard( { fnql::webui::KeyboardEventType::KeyUp,
+		0x08, 0 } ) );
+	CHECK( fake.keyboardCount == 2 );
+	CHECK( fake.lastKeyboard.type == fnql::webui::KeyboardEventType::KeyUp );
+	CHECK( fake.lastKeyboard.virtualKey == 0x08 );
+	CHECK( fake.lastKeyboard.nativeKey == 0 );
+	CHECK( host.InjectKeyboard( {} ).code == BackendError::InvalidArgument );
+	CHECK( fake.keyboardCount == 2 );
 
 	CHECK( host.StopLoading() );
 	CHECK( fake.stopCount == 1 );

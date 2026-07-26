@@ -21,6 +21,12 @@ CSV/JSON report writing.
 that `--material-map` can override generated material, preset, and flag metadata
 before the sidecar is dumped back through the compiler.
 
+`fnql_audio_tone_tests` exercises the per-voice tone policy in
+`code/client/audio/shared/AudioTonePolicy.h` without an OpenAL device. It covers
+source classification, the diegetic boundary that keeps announcer, UI, and
+feedback audio out of the environment, underwater shaping of the listener's own
+sounds, and the unchanged world, authored-stereo, and strong-occlusion paths.
+
 `fnql_audio_recovery_tests` exercises the OpenAL device recovery policy without needing real hardware disconnects. It covers poll timing, retry suppression, one-shot disconnect/reconnect messages, disabled auto-recovery behavior, successful recovery reset, refresh-query failure behavior, and manual force/skip decisions.
 
 The harness currently checks:
@@ -42,4 +48,4 @@ python tests/audio/audio_zone_sweep_tests.py
 python tests/audio/audio_zone_material_map_tests.py meson/build/fnql-audiozonesc
 ```
 
-The loopback test exits with code `77` when OpenAL or `ALC_SOFT_loopback` is unavailable. CTest treats that as a skip. The zone runtime and recovery policy tests do not require OpenAL.
+The loopback test exits with code `77` when OpenAL or `ALC_SOFT_loopback` is unavailable. CTest treats that as a skip. The zone runtime, tone policy, and recovery policy tests do not require OpenAL.

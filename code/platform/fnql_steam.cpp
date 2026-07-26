@@ -61,6 +61,9 @@ struct SteamState {
 	bool initialized{};
 	bool commandRegistered{};
 	bool fallbackAnnounced{};
+	/* Process-lifetime latch.  The sign-in notification belongs to engine
+	 * startup; a later reconfigure must never open a modal mid-session. */
+	bool loginPromptOffered{};
 	fnqlSteamEngineEventFn eventSink{};
 	void *eventContext{};
 	std::array<EventObserver, MaxEventObservers> eventObservers{};
@@ -456,46 +459,97 @@ fnqlSteamResult_t UnavailableResult() {
 		: FNQL_STEAM_RESULT_UNAVAILABLE;
 }
 
-} // namespace
-
-extern "C" {
-
-void FNQL_Steam_Init(uint32_t roles) {
-	cvar_t *enabled = Cvar_Get("com_steamIntegration", "1", CVAR_ARCHIVE | CVAR_INIT);
-	cvar_t *providerName = Cvar_Get("com_steamProvider", kDefaultProviderName,
-		CVAR_ARCHIVE | CVAR_INIT | CVAR_PROTECTED);
-	cvar_t *steamApiName = Cvar_Get("com_steamApi", "",
-		CVAR_INIT | CVAR_PROTECTED);
-	Cvar_Get("com_steamProviderStatus", "disabled", CVAR_ROM);
-	Cvar_Get("com_steamProviderName", "none", CVAR_ROM);
-	Cvar_Get("com_steamProviderVersion", "none", CVAR_ROM);
-	Cvar_Get("com_steamProviderCapabilities", "0x0000000000000000", CVAR_ROM);
-	Cvar_Get("com_steamProviderDetail", "Steam integration is disabled by policy.", CVAR_ROM);
-
-	if (!state.commandRegistered) {
-		Cmd_AddCommand("steam_status", SteamStatusCommand);
-		state.commandRegistered = true;
+/* A provider can start without an active Steam user, so the account is a
+ * separate condition from the provider and Steam API libraries being present.
+ * Both halves of the identity must be real before the session counts as signed
+ * in; FnQL never fabricates a SteamID for a signed-out account. */
+bool SteamAccountSignedIn() {
+	fnqlSteamStatus_t status{};
+	status.size = sizeof(status);
+	if (!FNQL_Steam_GetStatus(&status)) {
+		return false;
 	}
-	if (state.initialized) {
-		return;
+	return status.client_logged_on != 0 && status.local_steam_id != 0;
+}
+
+/* Tear the provider back down to the pre-load state for another attempt without
+ * disturbing the registered console command or the requested roles. */
+void ReleaseProviderForRetry() {
+	if (state.provider && state.initialized) {
+		state.provider->shutdown();
 	}
-	state.roles = roles;
+	state.initialized = false;
 	state.capabilities = 0;
+	state.provider = nullptr;
+	if (state.library) {
+		CloseLibrary(state.library);
+	}
+	state.library = nullptr;
+	state.nextCapabilityRefresh = 0;
+	state.providerPath[0] = '\0';
+}
 
+sysStartupChoice_t PromptForSteamLogin() {
+	char message[FNQL_STEAM_TEXT_CAPACITY + 512];
+
+	state.loginPromptOffered = true;
+	Com_sprintf(message, sizeof(message),
+		"FnQL could not find a signed-in Steam account.\n\n%s\n\n"
+		"Retail Quake Live sessions, Workshop downloads, and authenticated "
+		"servers need the Steam client running with your account signed in.\n\n"
+		"Continue to play without Steam services, retry after signing in, or "
+		"quit FnQL.",
+		state.detail[0] ? state.detail : "Steam reported no active user.");
+	return Sys_PromptStartupChoice("FnQL - Steam sign-in", message);
+}
+
+/* Returns true when the caller should attempt provider startup again.  A quit
+ * answer never returns; anything else keeps the documented non-Steam fallback. */
+bool ResolveMissingSteamLogin(bool offerChoice) {
+	if (!offerChoice) {
+		/* Nothing to answer the notification: leave the already-printed
+		 * non-Steam explanation as the only account diagnostic. */
+		return false;
+	}
+	const sysStartupChoice_t choice = PromptForSteamLogin();
+	if (choice == SYS_STARTUP_RETRY) {
+		Com_Printf("Rechecking for a signed-in Steam account.\n");
+		ReleaseProviderForRetry();
+		return true;
+	}
+	if (choice == SYS_STARTUP_QUIT) {
+		Com_Printf("Quitting FnQL at the Steam sign-in notification.\n");
+		Com_Quit_f();
+	}
+	Com_Printf("Continuing without a signed-in Steam account.\n");
+	return false;
+}
+
+/* One provider startup attempt.  A signed-out result means the libraries
+ * themselves are fine, or expectedly unavailable, and only the Steam account is
+ * missing; the caller can then offer the sign-in notification without having to
+ * re-derive the cause. */
+enum class SteamSession {
+	Resolved,
+	SignedOut,
+};
+
+SteamSession StartSteamProvider(uint32_t roles, const cvar_t *enabled,
+	const char *providerName, const char *steamApiName) {
 	if (!enabled->integer) {
 		SetDetail("Steam integration is disabled by +set com_steamIntegration 0.");
 		SetStatusCvars("disabled", "none", "none");
-		return;
+		return SteamSession::Resolved;
 	}
 
 	char providerFallbackPath[FNQL_STEAM_PATH_CAPACITY]{};
-	BuildCandidatePaths(providerName->string,
+	BuildCandidatePaths(providerName,
 		state.providerPath, sizeof(state.providerPath),
 		providerFallbackPath, sizeof(providerFallbackPath));
 	if (!state.providerPath[0]) {
 		EnterNonSteamFallback("rejected", "none", "none",
 			"com_steamProvider must be an absolute path or a bare library name.");
-		return;
+		return SteamSession::Resolved;
 	}
 	state.library = OpenLibrary(state.providerPath);
 	if (!state.library && providerFallbackPath[0]) {
@@ -506,7 +560,7 @@ void FNQL_Steam_Init(uint32_t roles) {
 		EnterNonSteamFallback("unavailable", "none", "none",
 			va("Steam provider library was not found or could not be loaded: %s",
 				state.providerPath));
-		return;
+		return SteamSession::Resolved;
 	}
 
 	auto getProvider = reinterpret_cast<fnqlSteamGetProviderFn>(
@@ -516,7 +570,7 @@ void FNQL_Steam_Init(uint32_t roles) {
 		state.library = nullptr;
 		EnterNonSteamFallback("invalid", "none", "none",
 			"Steam provider does not export the required versioned entry point.");
-		return;
+		return SteamSession::Resolved;
 	}
 	state.provider = getProvider(FNQL_STEAM_ABI_VERSION);
 	const size_t requiredProviderSize = offsetof(fnqlSteamProvider_t, update_game_server)
@@ -532,7 +586,7 @@ void FNQL_Steam_Init(uint32_t roles) {
 		state.provider = nullptr;
 		EnterNonSteamFallback("incompatible", "none", "none",
 			"Steam provider ABI is incompatible or incomplete.");
-		return;
+		return SteamSession::Resolved;
 	}
 
 	fnqlSteamHost_t host{};
@@ -549,7 +603,7 @@ void FNQL_Steam_Init(uint32_t roles) {
 	startup.roles = roles;
 	CopyText(startup.retail_install_path, sizeof(startup.retail_install_path),
 		Sys_SteamPath());
-	BuildSteamApiPath(steamApiName->string, startup.steam_api_path,
+	BuildSteamApiPath(steamApiName, startup.steam_api_path,
 		sizeof(startup.steam_api_path));
 	if (!startup.steam_api_path[0]) {
 		char providerDisplayName[FNQL_STEAM_NAME_CAPACITY];
@@ -561,7 +615,7 @@ void FNQL_Steam_Init(uint32_t roles) {
 		state.provider = nullptr;
 		EnterNonSteamFallback("rejected", providerDisplayName, providerVersion,
 			"Steam API path is unavailable or com_steamApi is not absolute.");
-		return;
+		return SteamSession::Resolved;
 	}
 	CopyText(startup.product_name, sizeof(startup.product_name), "FnQL");
 	CopyText(startup.product_version, sizeof(startup.product_version), Q3_VERSION);
@@ -588,7 +642,11 @@ void FNQL_Steam_Init(uint32_t roles) {
 		EnterNonSteamFallback(result == FNQL_STEAM_RESULT_UNAVAILABLE
 			? "unavailable" : "startup-failed", providerDisplayName, providerVersion,
 			failureDetail);
-		return;
+		/* Retail treats a running Steam client with no active user as an
+		 * expected unavailable state rather than a provider fault, so this is
+		 * the signed-out shape a sign-in can still fix. */
+		return result == FNQL_STEAM_RESULT_UNAVAILABLE
+			? SteamSession::SignedOut : SteamSession::Resolved;
 	}
 
 	state.capabilities = ValidatedCapabilities(state.provider,
@@ -604,7 +662,7 @@ void FNQL_Steam_Init(uint32_t roles) {
 		state.provider = nullptr;
 		EnterNonSteamFallback("no-capabilities", providerDisplayName, providerVersion,
 			"Steam provider exposed no usable capabilities.");
-		return;
+		return SteamSession::Resolved;
 	}
 	state.initialized = true;
 	SetDetail("Steam provider started successfully.");
@@ -612,6 +670,65 @@ void FNQL_Steam_Init(uint32_t roles) {
 	Com_Printf("Steam provider %s %s active (capabilities 0x%016llx).\n",
 		state.provider->info.name, state.provider->info.version,
 		static_cast<unsigned long long>(state.capabilities));
+
+	/* The provider and the retail Steam API can both be present while the Steam
+	 * client has no active user, so the account is validated in the same startup
+	 * pass as the libraries.  A game server has no account of its own and keeps
+	 * the existing unauthenticated lane. */
+	if ((roles & FNQL_STEAM_ROLE_CLIENT) != 0 && !SteamAccountSignedIn()) {
+		SetDetail("Steam provider started without a signed-in Steam account.");
+		Com_Printf(S_COLOR_YELLOW "Steam has no signed-in account; retail sessions, "
+			"Workshop downloads, and authenticated servers stay unavailable until "
+			"you sign in.\n");
+		return SteamSession::SignedOut;
+	}
+	return SteamSession::Resolved;
+}
+
+} // namespace
+
+extern "C" {
+
+void FNQL_Steam_Init(uint32_t roles) {
+	cvar_t *enabled = Cvar_Get("com_steamIntegration", "1", CVAR_ARCHIVE | CVAR_INIT);
+	cvar_t *providerName = Cvar_Get("com_steamProvider", kDefaultProviderName,
+		CVAR_ARCHIVE | CVAR_INIT | CVAR_PROTECTED);
+	cvar_t *steamApiName = Cvar_Get("com_steamApi", "",
+		CVAR_INIT | CVAR_PROTECTED);
+	cvar_t *loginPrompt = Cvar_Get("com_steamLoginPrompt", "1",
+		CVAR_ARCHIVE | CVAR_INIT);
+	Cvar_SetDescription(loginPrompt, "Offer a proceed/retry/quit notification at "
+		"startup when Steam has no signed-in account; zero continues silently.");
+	Cvar_Get("com_steamProviderStatus", "disabled", CVAR_ROM);
+	Cvar_Get("com_steamProviderName", "none", CVAR_ROM);
+	Cvar_Get("com_steamProviderVersion", "none", CVAR_ROM);
+	Cvar_Get("com_steamProviderCapabilities", "0x0000000000000000", CVAR_ROM);
+	Cvar_Get("com_steamProviderDetail", "Steam integration is disabled by policy.", CVAR_ROM);
+
+	if (!state.commandRegistered) {
+		Cmd_AddCommand("steam_status", SteamStatusCommand);
+		state.commandRegistered = true;
+	}
+	if (state.initialized) {
+		return;
+	}
+	state.roles = roles;
+	state.capabilities = 0;
+
+	/* Only a client session has an account to sign in, the notification is a
+	 * startup-only decision, and deterministic build-script runs must never
+	 * block on one. */
+	const bool offerLoginChoice = (roles & FNQL_STEAM_ROLE_CLIENT) != 0
+		&& loginPrompt->integer != 0
+		&& !state.loginPromptOffered
+		&& !Cvar_VariableIntegerValue("com_buildScript");
+
+	while (StartSteamProvider(roles, enabled, providerName->string,
+		steamApiName->string) == SteamSession::SignedOut) {
+		if (!ResolveMissingSteamLogin(offerLoginChoice)) {
+			break;
+		}
+	}
 }
 
 void FNQL_Steam_Reconfigure(uint32_t roles) {

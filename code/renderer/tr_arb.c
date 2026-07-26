@@ -35,6 +35,8 @@ static int programEnabled	= 0;
 static qboolean globalFogProgramCompiled = qfalse;
 static qboolean globalFogCompositorStateLogged = qfalse;
 static qboolean globalFogCompositorActiveLogged = qfalse;
+static qboolean underwaterProgramCompiled = qfalse;
+static qboolean underwaterCompositorActiveLogged = qfalse;
 static qboolean dlightShadowProgramsCompiled = qfalse;
 static qboolean csmShadowProgramsCompiled = qfalse;
 static qboolean dlightShadowCasterVPCompiled = qfalse;
@@ -111,6 +113,7 @@ static frameBuffer_t motionBlurBuffer;
 static motionBlurViewState_t motionBlurViewState;
 static int motionBlurFrame = -1;
 static qboolean motionBlurCreateFailed = qfalse;
+static int underwaterFrame = -1;
 
 static qboolean frameBufferMultiSampling = qfalse;
 
@@ -2569,6 +2572,7 @@ static const char *liquidSheenFP = {
 	"PARAM edge = { 12.5, 3.0, -2.0, 1.0 }; \n"
 	"PARAM bounds = { 0.002, 0.998, 16.0, 0.5 }; \n"
 	"PARAM alphaCurve = { 0.04, 0.56, 2.0, 0.0 }; \n"
+	"PARAM frame = { 0.9, 0.0, 1.0, 0.0 }; \n" /* tangent axis pick, 0, 1 */
 	"TEMP n, v, len, phase, wave, grad, r, p, clip, uvr, e, s, valid, refl; \n"
 	"DP3 n.w, fragment.texcoord[2], fragment.texcoord[2]; \n"
 	"RSQ n.w, n.w; \n"
@@ -2587,15 +2591,34 @@ static const char *liquidSheenFP = {
 	"MUL grad.xy, waveDir12, wave.x; \n"
 	"MAD grad.xy, waveDir12.zwzw, wave.y, grad; \n"
 	"MAD grad.xy, waveDir3, wave.z, grad; \n"
-	"MOV grad.zw, alphaCurve.w; \n"
-	"MAD n.xyz, grad, tune.x, n; \n"
+	/* Tangent frame for the wave perturbation: reference = |n.z| < 0.9 ?
+	 * (0,0,1) : (0,1,0), built arithmetically because an ARB instruction may
+	 * name only one program parameter. A horizontal face reduces to exactly
+	 * ( gradientX, gradientY, 0 ), matching the GLSL tiers. phase and wave are
+	 * dead once the gradient exists, so the frame costs no extra temporary;
+	 * the program stays inside the 72-instruction ARB_fragment_program floor. */
+	"ABS r.x, n.z; \n"
+	"SGE r.y, r.x, frame.x; \n"
+	"SUB r.z, frame.z, r.y; \n"
+	"MOV r.x, frame.y; \n"
+	"XPD phase.xyz, r, n; \n"
+	"DP3 phase.w, phase, phase; \n"
+	"RSQ phase.w, phase.w; \n"
+	"MUL phase.xyz, phase, phase.w; \n"
+	"XPD wave.xyz, n, phase; \n"
+	"MUL phase.xyz, phase, grad.x; \n"
+	"MAD phase.xyz, wave, grad.y, phase; \n"
+	"MAD n.xyz, phase, tune.x, n; \n"
 	"DP3 n.w, n, n; \n"
 	"RSQ n.w, n.w; \n"
 	"MUL n.xyz, n, n.w; \n"
 	"DP3 len.w, n, v; \n"
 	"ABS s.x, len.w; \n"
+	/* Schlick's fifth-power Fresnel falloff */
 	"SUB_SAT s.y, edge.w, s.x; \n"
 	"MUL s.z, s.y, s.y; \n"
+	"MUL s.z, s.z, s.z; \n"
+	"MUL s.z, s.z, s.y; \n"
 	"MUL r.xyz, n, len.w; \n"
 	"MAD r.xyz, r, alphaCurve.z, -v; \n"
 	"MAD len.w, len.z, eyePos.w, sheen.w; \n"
@@ -2706,6 +2729,99 @@ static const char *globalFogFP = {
 	"LRP base.xyz, exponential.x, fogColor, base; \n"
 	"MOV base.w, one.w; \n"
 	"MOV result.color, base; \n"
+	"END \n"
+};
+
+/* Submerged-view compositor.  The wave field, dispersion split, edge falloff,
+ * absorption curve, and every constant below are shared with the Vulkan GLSL
+ * copy; see renderercommon/tr_underwater.h before changing any number here.
+ * tests/underwater_view_source_tests.py enforces the parity. */
+static const char *underwaterFP = {
+	"!!ARBfp1.0 \n"
+	"OPTION ARB_precision_hint_fastest; \n"
+	"PARAM waveX = program.local[0]; \n"     /* aspect-scaled wave vector x per octave */
+	"PARAM waveY = program.local[1]; \n"     /* wave vector y per octave */
+	"PARAM wavePhase = program.local[2]; \n" /* speed * wrapped scene time per octave */
+	"PARAM dirX = program.local[3]; \n"      /* octave displacement x, w = red scale */
+	"PARAM dirY = program.local[4]; \n"      /* octave displacement y, w = blue scale */
+	"PARAM fog = program.local[5]; \n"       /* medium color rgb, w = ramped max opacity */
+	"PARAM depth = program.local[6]; \n"     /* density, zNear*zFar, zNear, zFar-zNear */
+	"PARAM tune = program.local[7]; \n"      /* warp uv x, warp uv y, ramped edge, ramped fog */
+	"PARAM consts = { 0.0, 1.0, 0.002, 0.998 }; \n"
+	"PARAM curve = { -2.0, 3.0, 2.0, -1.0 }; \n"
+	"PARAM vignette = { 0.55, 1.30, 0.0, 0.0 }; \n"
+	"PARAM expScale = { -1.442695, 0.0001, 0.0, 0.0 }; \n"
+	"TEMP uv, phase, field, off, uvR, uvB, col, t, dep, s, lo, hi; \n"
+	"MOV uv, fragment.texcoord[0]; \n"
+	/* three octave phases at once; the x coefficients arrive aspect-scaled so
+	 * the field stays isotropic without a separate aspect multiply here */
+	"MUL phase.xyz, waveX, uv.x; \n"
+	"MAD phase.xyz, waveY, uv.y, phase; \n"
+	"ADD phase.xyz, phase, wavePhase; \n"
+	"SIN phase.x, phase.x; \n"
+	"SIN phase.y, phase.y; \n"
+	"SIN phase.z, phase.z; \n"
+	/* unit directions times amplitudes summing to one bound the field to the
+	 * unit disc, so the displacement never exceeds the authored pixel count */
+	"DP3 field.x, dirX, phase; \n"
+	"DP3 field.y, dirY, phase; \n"
+	"MUL off.xy, field, tune; \n"
+	/* short wavelengths refract further: red is displaced least, blue most */
+	"MUL uvR.xy, off, dirX.w; \n"
+	"MUL uvB.xy, off, dirY.w; \n"
+	"ADD uvR.xy, uv, uvR; \n"
+	"ADD uvB.xy, uv, uvB; \n"
+	"ADD s.xy, uv, off; \n"
+	/* bounding the sample to the texel-centre interval stretches the border
+	 * rather than wrapping it; the bounds widen to the fragment's own
+	 * coordinate inside that margin so a zero displacement is exact */
+	"MIN lo.xy, uv, consts.z; \n"
+	"MAX hi.xy, uv, consts.w; \n"
+	"MAX uvR.xy, uvR, lo; \n"
+	"MIN uvR.xy, uvR, hi; \n"
+	"MAX uvB.xy, uvB, lo; \n"
+	"MIN uvB.xy, uvB, hi; \n"
+	"MAX s.xy, s, lo; \n"
+	"MIN s.xy, s, hi; \n"
+	"TEX col, s, texture[0], 2D; \n"
+	"TEX field, uvR, texture[0], 2D; \n"
+	"TEX off, uvB, texture[0], 2D; \n"
+	"MOV col.x, field.x; \n"
+	"MOV col.z, off.z; \n"
+	/* edge falloff over the screen ellipse, in unscaled device coordinates */
+	"MAD t.xy, uv, curve.z, curve.w; \n"
+	"MOV t.z, consts.x; \n"
+	"DP3 t.w, t, t; \n"
+	"ADD t.w, t.w, expScale.y; \n"
+	"RSQ t.w, t.w; \n"
+	"RCP t.w, t.w; \n"
+	"SUB t.w, t.w, vignette.x; \n"
+	"SUB t.z, vignette.y, vignette.x; \n"
+	"RCP t.z, t.z; \n"
+	"MUL_SAT t.w, t.w, t.z; \n"
+	"MUL t.x, t.w, t.w; \n"
+	"MAD t.y, curve.x, t.w, curve.y; \n"
+	"MUL t.w, t.x, t.y; \n"
+	"MUL t.w, t.w, tune.z; \n"
+	"SUB t.w, consts.y, t.w; \n"
+	"MUL col.xyz, col, t.w; \n"
+	/* Beer-Lambert absorption against the opaque scene depth, sampled at the
+	 * same refracted coordinate so the medium follows the warped view */
+	"TEX dep, s, texture[1], 2D; \n"
+	"ADD dep.z, depth.z, depth.w; \n"
+	"MAD dep.y, -dep.x, depth.w, dep.z; \n"
+	"MAX dep.y, dep.y, expScale.y; \n"
+	"RCP dep.y, dep.y; \n"
+	"MUL dep.z, depth.y, dep.y; \n"
+	"MUL dep.z, dep.z, depth.x; \n"
+	"MUL dep.z, dep.z, expScale.x; \n"
+	"EX2 dep.z, dep.z; \n"
+	"SUB dep.z, consts.y, dep.z; \n"
+	"MUL dep.z, dep.z, tune.w; \n"
+	"MIN dep.z, dep.z, fog.w; \n"
+	"LRP col.xyz, dep.z, fog, col; \n"
+	"MOV col.w, consts.y; \n"
+	"MOV result.color, col; \n"
 	"END \n"
 };
 #endif
@@ -3357,6 +3473,8 @@ static void ARB_DeletePrograms( void )
 	globalFogProgramCompiled = qfalse;
 	globalFogCompositorStateLogged = qfalse;
 	globalFogCompositorActiveLogged = qfalse;
+	underwaterProgramCompiled = qfalse;
+	underwaterCompositorActiveLogged = qfalse;
 	dlightShadowProgramsCompiled = qfalse;
 	csmShadowProgramsCompiled = qfalse;
 #ifdef USE_FBO
@@ -3511,6 +3629,16 @@ qboolean ARB_UpdatePrograms( void )
 		} else {
 			ri.Printf( PRINT_WARNING,
 				"WARNING: optional global fog program unavailable; r_globalFog is disabled for this renderer session\n" );
+		}
+	}
+	underwaterProgramCompiled = qfalse;
+	if ( r_underwater && r_underwater->integer ) {
+		if ( ARB_CompileProgramInternal( Fragment, underwaterFP,
+			programs[ UNDERWATER_FRAGMENT ], qfalse ) ) {
+			underwaterProgramCompiled = qtrue;
+		} else {
+			ri.Printf( PRINT_WARNING,
+				"WARNING: optional underwater view program unavailable; r_underwater is disabled for this renderer session\n" );
 		}
 	}
 	if ( !ARB_CompileProgram( Fragment, ARB_BuildBlurProgram( buf, 7, qfalse, qtrue ), programs[ MOTION_BLUR_FRAGMENT ] ) )
@@ -4901,7 +5029,10 @@ void FBO_DrawGlobalFog( void )
 	const frameBuffer_t *source;
 	const frameBuffer_t *destination;
 	qboolean restore3D;
+	qboolean sceneLinear;
+	vec3_t sceneColor;
 	float opacity;
+	float outputScale;
 	float zNear;
 	float zFar;
 	int sourceIndex;
@@ -4931,6 +5062,15 @@ void FBO_DrawGlobalFog( void )
 	if ( opacity <= 0.0f || zNear <= 0.0f || zFar <= zNear ) {
 		return;
 	}
+
+	/* Match the multiplier FBO_SetOutputTransformParams applies to the scene
+	 * buffer so the authored color survives the output transform unchanged. */
+	sceneLinear = FBO_HdrSceneLinearColorMode() ? qtrue : qfalse;
+	outputScale = (float)( 1 << tr.overbrightBits );
+	if ( sceneLinear ) {
+		outputScale *= FBO_TonemapExposure();
+	}
+	R_GlobalFogSceneColor( fog, outputScale, sceneLinear, sceneColor );
 
 	if ( !FBO_DepthTextureReady() ) {
 		FBO_CopyDepthTexture();
@@ -4984,7 +5124,7 @@ void FBO_DrawGlobalFog( void )
 	GL_SelectTexture( 0 );
 	ARB_ProgramEnable( DUMMY_VERTEX, GLOBAL_FOG_FRAGMENT );
 	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 0,
-		fog->color[0], fog->color[1], fog->color[2], opacity );
+		sceneColor[0], sceneColor[1], sceneColor[2], opacity );
 	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 1,
 		fog->start, fog->end, fog->density, (float)fog->mode );
 	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 2,
@@ -4993,6 +5133,223 @@ void FBO_DrawGlobalFog( void )
 	ARB_ProgramDisable();
 
 	/* Bloom and motion blur consume the primary resolved scene buffer.  Copy
+	 * the ping-pong result back instead of bypassing those later passes. */
+	if ( destinationIndex != 0 ) {
+		FBO_Bind( GL_READ_FRAMEBUFFER, destination->fbo );
+		FBO_Bind( GL_DRAW_FRAMEBUFFER, frameBuffers[0].fbo );
+		qglBlitFramebuffer( 0, 0, destination->width, destination->height,
+			0, 0, frameBuffers[0].width, frameBuffers[0].height,
+			GL_COLOR_BUFFER_BIT, GL_NEAREST );
+	}
+	FBO_Bind( GL_FRAMEBUFFER, frameBuffers[0].fbo );
+	fboReadIndex = 0;
+
+	if ( restore3D ) {
+		qglMatrixMode( GL_PROJECTION );
+		qglPopMatrix();
+		qglMatrixMode( GL_MODELVIEW );
+		qglPopMatrix();
+		backEnd.projection2D = qfalse;
+	}
+}
+
+
+/*
+====================
+FBO_DrawUnderwater
+
+Composites the optional submerged view over the completed 3D scene: the whole
+frame is resampled through an animated wave field with a small per-channel
+dispersion, darkened toward the periphery, and absorbed toward the medium color
+with eye distance.  It runs after global fog and before motion blur, bloom, and
+gamma, so the layer belongs to the scene while later HUD and console drawing
+stays sharp.
+
+The pass reads the resolved scene color and the copied opaque depth through the
+ordinary ping-pong pair, so it never samples the attachment it is writing.  When
+the depth copy is unavailable the medium density is uploaded as zero, which
+leaves the warp and the edge falloff intact instead of dropping the whole layer.
+====================
+*/
+void FBO_DrawUnderwater( void )
+{
+	const frameBuffer_t *source;
+	const frameBuffer_t *destination;
+	vec4_t phaseCoeffs[UNDERWATER_WAVE_OCTAVES];
+	vec3_t dirAmp[UNDERWATER_WAVE_OCTAVES];
+	vec3_t sceneColor;
+	qboolean restore3D;
+	qboolean sceneLinear;
+	qboolean depthReady;
+	float strength;
+	float warpScale;
+	float warpPixels;
+	float dispersion;
+	float fogScale;
+	float vignette;
+	float waveTime;
+	float density;
+	float outputScale;
+	float zNear;
+	float zFar;
+	float aspect;
+	int contents;
+	int sourceIndex;
+	int destinationIndex;
+	int i;
+
+	if ( !r_underwater || !r_underwater->integer || !r_underwaterWarp ||
+		!r_underwaterDispersion || !r_underwaterFog || !r_underwaterVignette ||
+		!fboEnabled || !programCompiled || !underwaterProgramCompiled ||
+		( backEnd.refdef.rdflags & RDF_NOWORLDMODEL ) ) {
+		return;
+	}
+
+	strength = backEnd.refdef.underwaterStrength;
+	contents = backEnd.refdef.underwaterContents & UNDERWATER_CONTENTS_MASK;
+	if ( strength <= 0.0f || !contents ) {
+		return;
+	}
+
+	/* Recursive portal and mirror views are submitted before the primary view
+	 * and carry their own camera.  The medium belongs to the eye, so the layer
+	 * composites once, over the primary view only. */
+	if ( R_ViewPassIsPortal( &backEnd.viewParms ) ) {
+		return;
+	}
+	if ( backEnd.screenshotCubeActive || backEnd.screenshotCubeFrontPending ) {
+		return;
+	}
+	/* A stereo pair or an anaglyph frame would need one composite per eye; the
+	 * once-per-frame guard below deliberately keeps this to the single-view
+	 * case rather than half-applying the layer. */
+	if ( glConfig.stereoEnabled || ( r_anaglyphMode && r_anaglyphMode->integer ) ) {
+		return;
+	}
+	/* Projective coordinates cover the whole target, so a reduced or sub-rect
+	 * 3D viewport would warp and darken screen area the view does not own. */
+	if ( !R_LiquidViewportCoversTarget( backEnd.viewParms.viewportX,
+		backEnd.viewParms.viewportY, backEnd.viewParms.viewportWidth,
+		backEnd.viewParms.viewportHeight, glConfig.vidWidth, glConfig.vidHeight ) ) {
+		return;
+	}
+	if ( underwaterFrame == tr.frameCount ) {
+		return;
+	}
+
+	warpScale = Com_Clamp( 0.0f, UNDERWATER_WARP_SCALE_MAX, r_underwaterWarp->value ) *
+		R_UnderwaterContentsWarpScale( contents );
+	warpPixels = R_UnderwaterWarpPixels( warpScale, glConfig.vidHeight ) * strength;
+	dispersion = R_UnderwaterDispersion( r_underwaterDispersion->value );
+	fogScale = Com_Clamp( 0.0f, 1.0f, r_underwaterFog->value ) * strength;
+	vignette = Com_Clamp( 0.0f, 1.0f, r_underwaterVignette->value ) * strength;
+	if ( warpPixels <= 0.0f && fogScale <= 0.0f && vignette <= 0.0f ) {
+		return;
+	}
+
+	zNear = r_znear ? r_znear->value : 4.0f;
+	zFar = backEnd.viewParms.zFar;
+	if ( zNear <= 0.0f || zFar <= zNear ) {
+		return;
+	}
+
+	depthReady = qfalse;
+	if ( FBO_DepthTextureAvailable() ) {
+		if ( !FBO_DepthTextureReady() ) {
+			FBO_CopyDepthTexture();
+		}
+		depthReady = FBO_DepthTextureReady();
+	}
+	density = depthReady ? R_UnderwaterContentsDensity( contents ) : 0.0f;
+
+	/* Match the multiplier FBO_SetOutputTransformParams applies to the scene
+	 * buffer so the authored medium color survives the output transform. */
+	sceneLinear = FBO_HdrSceneLinearColorMode() ? qtrue : qfalse;
+	outputScale = (float)( 1 << tr.overbrightBits );
+	if ( sceneLinear ) {
+		outputScale *= FBO_TonemapExposure();
+	}
+	R_UnderwaterSceneColor( contents, outputScale, sceneLinear, sceneColor );
+
+	/* A multisample color target cannot be sampled directly.  Resolve scene
+	 * color and use the ping-pong pair so this pass never samples its own
+	 * color attachment. */
+	if ( frameBufferMultiSampling ) {
+		FBO_BlitMS( qfalse );
+		blitMSfbo = qfalse;
+	}
+
+	sourceIndex = fboReadIndex;
+	if ( sourceIndex < 0 || sourceIndex > 1 ) {
+		return;
+	}
+	destinationIndex = sourceIndex == 0 ? 1 : 0;
+	source = &frameBuffers[sourceIndex];
+	destination = &frameBuffers[destinationIndex];
+	if ( !source->color || !destination->fbo ) {
+		return;
+	}
+
+	underwaterFrame = tr.frameCount;
+	if ( !underwaterCompositorActiveLogged ) {
+		ri.Printf( PRINT_DEVELOPER,
+			"Underwater view: OpenGL compositor active (contents 0x%x, density %.6f, depth %i)\n",
+			contents, density, depthReady );
+		underwaterCompositorActiveLogged = qtrue;
+	}
+
+	waveTime = R_UnderwaterWaveTime( backEnd.refdef.floatTime );
+	for ( i = 0; i < UNDERWATER_WAVE_OCTAVES; i++ ) {
+		R_UnderwaterWaveOctave( i, phaseCoeffs[i], dirAmp[i] );
+		/* The octave speed travels pre-multiplied by the wrapped scene time so
+		 * the fragment stage evaluates a plain dot product plus a constant. */
+		phaseCoeffs[i][3] *= waveTime;
+	}
+	aspect = glConfig.vidHeight > 0 ?
+		(float)glConfig.vidWidth / (float)glConfig.vidHeight : 1.0f;
+
+	restore3D = !backEnd.projection2D;
+	if ( restore3D ) {
+		qglMatrixMode( GL_PROJECTION );
+		qglPushMatrix();
+		qglMatrixMode( GL_MODELVIEW );
+		qglPushMatrix();
+	}
+
+	RB_SetGL2D();
+	FBO_Bind( GL_FRAMEBUFFER, destination->fbo );
+	GL_Cull( CT_TWO_SIDED );
+	GL_State( GLS_DEPTHTEST_DISABLE | GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO );
+	qglColor4f( 1.0f, 1.0f, 1.0f, 1.0f );
+	GL_BindTexture( 0, source->color );
+	GL_BindTexture( 1, depthReady ? depthFadeTexture : 0 );
+	GL_SelectTexture( 0 );
+	ARB_ProgramEnable( DUMMY_VERTEX, UNDERWATER_FRAGMENT );
+	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 0,
+		phaseCoeffs[0][0] * aspect, phaseCoeffs[1][0] * aspect,
+		phaseCoeffs[2][0] * aspect, 0.0f );
+	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 1,
+		phaseCoeffs[0][1], phaseCoeffs[1][1], phaseCoeffs[2][1], 0.0f );
+	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 2,
+		phaseCoeffs[0][3], phaseCoeffs[1][3], phaseCoeffs[2][3], 0.0f );
+	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 3,
+		dirAmp[0][0], dirAmp[1][0], dirAmp[2][0], 1.0f + dispersion );
+	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 4,
+		dirAmp[0][1], dirAmp[1][1], dirAmp[2][1], 1.0f - dispersion );
+	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 5,
+		sceneColor[0], sceneColor[1], sceneColor[2],
+		UNDERWATER_FOG_MAX_OPACITY * strength );
+	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 6,
+		density, zNear * zFar, zNear, zFar - zNear );
+	qglProgramLocalParameter4fARB( GL_FRAGMENT_PROGRAM_ARB, 7,
+		warpPixels / (float)glConfig.vidWidth, warpPixels / (float)glConfig.vidHeight,
+		vignette, fogScale );
+	RenderQuad( glConfig.vidWidth, glConfig.vidHeight );
+	ARB_ProgramDisable();
+	GL_BindTexture( 1, 0 );
+	GL_SelectTexture( 0 );
+
+	/* Motion blur and bloom consume the primary resolved scene buffer.  Copy
 	 * the ping-pong result back instead of bypassing those later passes. */
 	if ( destinationIndex != 0 ) {
 		FBO_Bind( GL_READ_FRAMEBUFFER, destination->fbo );
@@ -6254,6 +6611,7 @@ void QGL_DoneFBO( void )
 		R_MotionBlur_ResetView( &motionBlurViewState );
 		motionBlurFrame = -1;
 		motionBlurCreateFailed = qfalse;
+		underwaterFrame = -1;
 #ifdef RENDERER_GLX
 		GLX_CompatRecordFboShutdown();
 #endif
@@ -6338,6 +6696,7 @@ void QGL_InitFBO( void )
 		frameBufferMultiSampling = qtrue;
 		if ( r_flares->integer || ( r_depthFade && r_depthFade->integer ) ||
 			( r_globalFog && r_globalFog->integer ) ||
+			( r_underwater && r_underwater->integer ) ||
 			R_CelShadingWorldActive() )
 			depthStencil = qtrue;
 		else

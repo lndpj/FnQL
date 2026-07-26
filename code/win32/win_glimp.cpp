@@ -1167,18 +1167,15 @@ void UpdateMonitorInfo( const RECT *target )
 		x = mInfo.rcMonitor.left;
 		y = mInfo.rcMonitor.top;
 
-		// try to detect DPI scale
-		// we can't properly handle it but at least detect monitor resolution 
-		// and inform user in console
-		if ( w > 0 && h > 0 && ( devMode.dmPelsWidth > static_cast<DWORD>( w ) || devMode.dmPelsHeight > static_cast<DWORD>( h ) ) ) {
-			int scaleX, scaleY;
-			scaleX = static_cast<int>( (devMode.dmPelsWidth * 100) / static_cast<DWORD>( w ) );
-			scaleY = static_cast<int>( (devMode.dmPelsHeight * 100) / static_cast<DWORD>( h ) );
-			if ( scaleX == scaleY ) {
-				Com_Printf( S_COLOR_YELLOW "...detected DPI scale: %i%%\n", scaleX );
-				w = devMode.dmPelsWidth;
-				h = devMode.dmPelsHeight;
-			}
+		// The process is per-monitor DPI aware (code/win32/q3.manifest), so
+		// rcMonitor is already in physical pixels and stays paired with the
+		// origin taken from it. Substituting the driver mode size here would
+		// keep a logical origin next to a physical extent and push fullscreen
+		// windows off the monitor, so a mismatch is only reported.
+		if ( w > 0 && h > 0 && ( devMode.dmPelsWidth != static_cast<DWORD>( w ) ||
+			devMode.dmPelsHeight != static_cast<DWORD>( h ) ) ) {
+			Com_DPrintf( S_COLOR_YELLOW "...monitor rect %ix%i differs from display mode %lux%lu\n",
+				w, h, devMode.dmPelsWidth, devMode.dmPelsHeight );
 		}
 
 		if ( glw_state.desktopWidth != w || glw_state.desktopHeight != h || 

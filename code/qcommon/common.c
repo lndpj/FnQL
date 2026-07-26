@@ -3939,7 +3939,16 @@ void Com_Init( char *commandLine ) {
 	// init commands and vars
 	//
 #ifndef DEDICATED
-	com_maxfps = Cvar_Get( "com_maxfps", "125", 0 ); // try to force that in some light way
+	// Quake Live persists the frame cap: QLSRP registers it CVAR_ARCHIVE |
+	// CVAR_VM_CREATED | CVAR_CLOUD, its cgame adds CVAR_PROTECTED, and a retail
+	// install writes "seta com_maxfps" into repconfig.cfg. FnQ3 left it
+	// unflagged, which reset a menu-chosen cap on every launch. CVAR_PROTECTED
+	// selects the same replicated config file here. CVAR_VM_CREATED is
+	// deliberately not copied: Cvar_Restart( qtrue ) on a game-directory change
+	// unsets those, and this cvar is held by an engine pointer read every frame.
+	// FnQL keeps its own wider 0..1000 range.
+	com_maxfps = Cvar_Get( "com_maxfps", "125",
+		CVAR_ARCHIVE | CVAR_PROTECTED | CVAR_CLOUD );
 	Cvar_CheckRange( com_maxfps, "0", "1000", CV_INTEGER );
 	Cvar_SetDescription( com_maxfps, "Sets maximum frames per second." );
 	com_maxfpsUnfocused = Cvar_Get( "com_maxfpsUnfocused", "60", CVAR_ARCHIVE_ND );

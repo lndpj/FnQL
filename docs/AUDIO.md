@@ -250,6 +250,8 @@ Important details:
 
 Occlusion is useful when you want walls, doors, and arena structure to affect how remote sounds read. FnQL smooths occlusion changes over time and applies separate direct-path attenuation and tone filtering, so moving behind a wall should sound like a transition rather than a hard step. The guaranteed dry-path gain change is intentionally audible even on devices without EFX filters; EFX-capable devices add the stronger low-pass/band-pass tone shift on top. If the result feels too dull, reducing `s_alOcclusionStrength` is usually a better first move than disabling the feature entirely.
 
+Weapon impacts and explosions are emitted flush against the surface they hit, so the occlusion test samples the direct path from just clear of that surface rather than from the raw event origin, and it discards probes that land inside world geometry instead of counting them as obstructions. A rocket, grenade, or plasma detonation you can see is therefore measured against what is actually between you and it, not against the wall, floor, or corner it went off on. A sound genuinely emitted inside geometry still reads as occluded.
+
 ### Audio Visibility And Culling
 
 FnQL plays the transient and looping sounds requested by the client module, then applies source budgets, distance attenuation, and optional trace-based occlusion. For retail QL parity, `s_pvs 1` additionally mutes positional sounds whose origins are outside the listener's current BSP PVS. The check is off by default and fails open when no valid collision world is loaded; it does not affect local/UI audio, music, raw/cinematic PCM, or remote voice chat.
@@ -276,7 +278,8 @@ FnQL uses a small set of EFX filter presets for source classes rather than a ful
 - World sounds use low-pass shaping from the current environment and occlusion state.
 - Heavily occluded and underwater sounds can use band-pass shaping so blocked sounds lose some low-end weight as well as high-frequency detail.
 - Local UI, chat, and announcer-style sounds can use light high-pass shaping so they stay separate from the arena mix.
-- Stereo samples, music, and raw audio keep their authored direct path by default; they are not spatialized or re-EQed for HRTF.
+- Sounds emitted by your own player, such as a held weapon's fire loop, keep that same dry close-up character but are still in the level with you: when you go under water they are muffled along with everything else. Only announcer, UI, and feedback audio is exempt from the environment.
+- Stereo samples, music, and raw audio keep their authored direct path by default; they are not spatialized or re-EQed for HRTF. A two-channel world sample that opts into positional playback with `s_alSpatializeStereo 1` is treated as a world source and shaped like one.
 
 ### Optional Audio Zone Sidecars
 
@@ -286,15 +289,17 @@ FnQL can read optional compiled audio-zone sidecars named `maps/<mapname>.azb`. 
 - `s_alAudioZones 0`: Ignore sidecars and use generic environment heuristics only.
 - `s_info`: Reports whether audio zones are disabled, missing, loaded, and which zone is currently active.
 - `s_alDebugOverlay 2` and `s_alDebugDump`: Include active zone name, material metadata, portal blend target when one is active, plus the zone-adjusted wet, low/high-frequency, occlusion, and transition values.
-- FnQL checks `FnQL-pkg.fnz` next to the executable before normal game data for sidecars, using game-dir-prefixed entries such as `baseq3/maps/campgrounds.azb` or `missionpack/maps/<mapname>.azb`.
+- FnQL checks `FnQL-pkg.fnz` next to the executable before normal game data for sidecars, using game-dir-prefixed entries such as `baseq3/maps/campgrounds.azb` or `<gamedir>/maps/<mapname>.azb`.
 
 Sidecars are compiled with the repo tool target `fnql-audiozonesc`. Maintainers can write `maps/<mapname>.audiozones` by hand or generate a first-pass sidecar from an existing `.bsp`, then layer small overrides on top. Current sidecars can carry material metadata, portal hints, and optional per-portal blend tuning while older version 1 and version 2 sidecars remain readable. The compiler workflow and authoring syntax are documented in the maintainer notes and in `code/tools/audiozones/README.md`.
 
+Generated zones are built by merging BSP leaves back into room-scale volumes along their real open contact area, so a zone corresponds to a place in the map rather than to whichever leaves happened to share a bounding box. Environment presets follow the merged volume's size and shape, `underwater` is only set for volumes actually inside a liquid brush, `outdoor` follows how much sky the volume can see, and portal hints and their blend tuning are derived from the size and openness of the real connection between two zones.
+
 ### Weapon Sound Shaders
 
-The OpenAL backend also reads a small FnQL sound shader file, `sound/fnql-weapon-sounds.sndshd`, from `FnQL-pkg.fnz`. The format intentionally follows the idTech4/Quake 4 declaration style: `sound <name> { minDistance ... maxDistance ... volumeDb ... shakes ... sample }`. The shipped `baseq3` shader covers the standard Quake III Arena weapon effects, while the shipped `missionpack` shader covers Team Arena weapon firing and impacts. Their tuning is imported exactly from FnQ3 (apart from FnQL declaration names), preserving the same attack, distance, pitch, shake, and reverb treatment without replacing the retail samples.
+The OpenAL backend also reads a small FnQL sound shader file, `sound/fnql-weapon-sounds.sndshd`, from `FnQL-pkg.fnz`. The format intentionally follows the idTech4/Quake 4 declaration style: `sound <name> { minDistance ... maxDistance ... volumeDb ... shakes ... sample }`. The shipped `baseq3` shader covers the standard Quake III Arena weapon effects. Its tuning is imported exactly from FnQ3 (apart from FnQL declaration names), preserving the same attack, distance, pitch, shake, and reverb treatment without replacing the retail samples.
 
-Like audio zones, the root package stores this with a game-dir prefix, for example `baseq3/sound/fnql-weapon-sounds.sndshd` or `missionpack/sound/fnql-weapon-sounds.sndshd`. Mods can ship their own game-dir entry in the root package source tree when they need different tuning.
+Like audio zones, the root package stores this with a game-dir prefix, for example `baseq3/sound/fnql-weapon-sounds.sndshd`. Mods can ship their own game-dir entry in the root package source tree when they need different tuning.
 
 ### Doppler
 

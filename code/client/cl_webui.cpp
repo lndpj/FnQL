@@ -69,8 +69,16 @@ BackendHost &ClientBackendHost() noexcept {
 #define CL_WEB_MAX_RESOURCE_BYTES ( 64 * 1024 * 1024 )
 #define CL_WEB_BRIDGE_RETRY_FRAMES 30
 #define CL_WEB_CONFIG_SYNC_FRAMES 300
-#define CL_WEB_CONFIG_JSON_LENGTH 8192
+// The settings snapshot carries every cvar the retail settings sections and the
+// FnQL overlay bind rows to. Both retail components read their initial values
+// from this snapshot only, so a truncated snapshot presents rows with defaults
+// instead of the player's configuration.
+#define CL_WEB_CONFIG_CVAR_JSON_LENGTH 32768
+#define CL_WEB_CONFIG_BIND_JSON_LENGTH 8192
+#define CL_WEB_CONFIG_JSON_LENGTH \
+	( CL_WEB_CONFIG_CVAR_JSON_LENGTH + CL_WEB_CONFIG_BIND_JSON_LENGTH + 4096 )
 #define CL_WEB_CONFIG_ITEM_LENGTH 1536
+#define CL_WEB_FRIEND_ITEM_LENGTH 8192
 #define CL_WEB_FRIEND_JSON_LENGTH 262144
 #define CL_WEB_CATALOG_JSON_LENGTH 65536
 #define CL_WEB_CATALOG_FILE_LIST_LENGTH 32768
@@ -797,17 +805,22 @@ static qboolean CL_Steam_GetLocalIdentityWords( unsigned int *identityLow,
 	return qtrue;
 }
 
+/*
+Retail exposes the local identity as the read-only qz_instance.playerName, which
+the UI renders through its color stripper. Publish the same value the engine put
+in userinfo so the profile card, the scoreboard, and remote servers agree on one
+name instead of differing by normalization.
+*/
 static void CL_Steam_GetLocalDisplayName( char *buffer, size_t bufferSize ) {
-	fnqlSteamStatus_t status = {};
+	const char *identity;
 
 	if ( !buffer || bufferSize == 0 ) {
 		return;
 	}
 	buffer[0] = '\0';
-	status.size = sizeof( status );
-	if ( FNQL_Steam_Available( FNQL_STEAM_CAP_IDENTITY )
-		&& FNQL_Steam_GetStatus( &status ) && status.persona_name[0] ) {
-		Q_strncpyz( buffer, status.persona_name, (int)bufferSize );
+	identity = CL_SteamIdentityName();
+	if ( identity[0] ) {
+		Q_strncpyz( buffer, identity, (int)bufferSize );
 		return;
 	}
 	Cvar_VariableStringBuffer( "name", buffer, (int)bufferSize );
@@ -1260,6 +1273,29 @@ static void CL_WebHost_MarkBrowserUnavailable( void ) {
 	CL_RefreshOnlineServicesBridgeState();
 }
 
+/*
+=============
+CL_WebHost_ResumeRetainedDocument
+
+A game transition pauses rendering and unfocuses the retained document so the
+native connect, loading, and gameplay screens own the frame.  Retail's in-game
+Escape menu reaches the same document again through `web_changeHash`, so the
+route change alone is not enough: a still-paused view keeps presenting the last
+pre-game bitmap and an unfocused Awesomium view discards every injected mouse
+and key event.  Restore both before the overlay is presented again.
+=============
+*/
+static qboolean CL_WebHost_ResumeRetainedDocument( void ) {
+	fnql::webui::BackendHost &host = fnql::webui::ClientBackendHost();
+
+	if ( !host.IsRunning() ) {
+		return qfalse;
+	}
+
+	return ( CL_WebUI_RecordBackendResult( host.SetRenderingPaused( false ) )
+		&& CL_WebUI_RecordBackendResult( host.SetFocus( true ) ) ) ? qtrue : qfalse;
+}
+
 static qboolean CL_WebHost_SetLocationHash( const char *hash ) {
 	char escapedHash[MAX_STRING_CHARS * 2];
 	char script[MAX_STRING_CHARS * 3];
@@ -1299,7 +1335,9 @@ static qboolean CL_WebHost_OpenRequestedURL( const char *requestedUrl, const cha
 		Q_strncpyz( cl_webui.currentUrl, requestedUrl, sizeof( cl_webui.currentUrl ) );
 		cl_webui.pendingHash[0] = '\0';
 	} else {
-		if ( CL_WebHost_HasLiveView() && CL_WebHost_HasBoundWindowObject() && CL_WebHost_SetLocationHash( requestedUrl ) ) {
+		if ( CL_WebHost_HasLiveView() && CL_WebHost_HasBoundWindowObject()
+			&& CL_WebHost_SetLocationHash( requestedUrl )
+			&& CL_WebHost_ResumeRetainedDocument() ) {
 			cl_webui.browserVisible = qtrue;
 			cl_webui.browserActive = qtrue;
 			CL_RefreshOnlineServicesBridgeState();
@@ -1520,7 +1558,10 @@ static void CL_Web_Status_f( void ) {
 		{ "mainHook", "(function(){return typeof window.main_hook_v2==='function'?1:0;})()" },
 		{ "fnqlStyle", "(function(){return document.getElementById('fnql-settings-style')?1:0;})()" },
 		{ "fnqlScript", "(function(){return window.__fnql_settings_script_loaded?1:0;})()" },
-		{ "fnqlTab", "(function(){return document.querySelector('.fnql-settings-tab')?1:0;})()" }
+		{ "fnqlRows", "(function(){return document.querySelectorAll('.fnql-cvar').length;})()" },
+		{ "fnqlGroups", "(function(){return document.querySelectorAll('.fnql-group').length;})()" },
+		{ "fnqlHiddenRetailRows", "(function(){return document.querySelectorAll('.fnql-retail-hidden').length;})()" },
+		{ "fnqlActions", "(function(){return document.querySelectorAll('.fnql-actions button').length;})()" }
 	};
 
 	if ( !CL_WebHost_HasLiveView() ) {
@@ -2353,15 +2394,20 @@ static qboolean CL_WebHost_InjectStartupBridge( qboolean retryOnly ) {
 		CL_WebHost_BuildStartupBridgeRetryScript(
 			retryScript, sizeof( retryScript ) );
 	} else {
-		char configJson[CL_WEB_CONFIG_JSON_LENGTH];
+		char *configJson = static_cast<char *>( Z_Malloc( CL_WEB_CONFIG_JSON_LENGTH ) );
 		char *factoryJson = CL_WebHost_AllocateFactoryListJson();
 		char *friendJson = static_cast<char *>( Z_Malloc( CL_WEB_FRIEND_JSON_LENGTH ) );
-		CL_WebHost_BuildConfigJson( configJson, sizeof( configJson ) );
+		if ( configJson ) {
+			CL_WebHost_BuildConfigJson( configJson, CL_WEB_CONFIG_JSON_LENGTH );
+		}
 		if ( friendJson ) {
 			CL_WebHost_BuildFriendListJson( friendJson, CL_WEB_FRIEND_JSON_LENGTH );
 		}
-		script = factoryJson && friendJson
+		script = configJson && factoryJson && friendJson
 			? CL_WebHost_AllocateStartupBridgeScript( configJson, factoryJson, friendJson ) : NULL;
+		if ( configJson ) {
+			Z_Free( configJson );
+		}
 		if ( factoryJson ) {
 			Z_Free( factoryJson );
 		}
@@ -3056,29 +3102,156 @@ static void CL_WebHost_BuildConfigCvarJson( char *buffer, size_t bufferSize ) {
 		"cl_fnqlWebPakSource",
 		"cl_fnqlWebPakVersion",
 		"cl_fnqlWebPakResourceCount",
+
+		// Display and renderer selection.
 		"cl_renderer",
 		"r_mode",
 		"r_modeFullscreen",
+		"r_windowedMode",
+		"r_windowedWidth",
+		"r_windowedHeight",
 		"r_fullscreen",
 		"r_noborder",
 		"r_customWidth",
 		"r_customHeight",
+		"r_customPixelAspect",
 		"r_displayRefresh",
 		"r_swapInterval",
-		"r_ext_multisample",
-		"r_renderScale",
+		"r_gamma",
+
+		// Framebuffer path, sampling, and internal resolution.
 		"r_fbo",
+		"r_ext_multisample",
+		"r_ext_alpha_to_coverage",
+		"r_ext_supersample",
+		"r_renderScale",
+		"r_renderWidth",
+		"r_renderHeight",
+		"r_hudExcludePostProcess",
+
+		// Texture and geometry detail.
+		"r_texturemode",
+		"r_picmip",
+		"r_picmipFilter",
+		"r_nomip",
+		"r_simpleMipMaps",
+		"r_ext_texture_filter_anisotropic",
+		"r_ext_max_anisotropy",
+		"r_intensity",
+		"r_overBrightBits",
+		"r_mapOverBrightBits",
+		"r_mapOverBrightCap",
+		"r_vertexLight",
+		"r_detailtextures",
+		"r_neatsky",
+		"r_fastsky",
+		"r_lodbias",
+		"r_lodCurveError",
+		"r_subdivisions",
+		"r_vbo",
+		"r_mergeLightmaps",
+		"r_marksOnTriangleMeshes",
+		"r_teleporterFlash",
+		"r_inGameVideo",
+
+		// Lighting and shadowing.
+		"r_dynamiclight",
+		"r_dlightMode",
+		"r_dlightScale",
+		"r_dlightIntensity",
+		"r_dlightShadows",
+		"r_dlightShadowFilter",
+		"r_dlightShadowResolution",
+		"r_dlightShadowMaxLights",
+		"r_muzzleFlashDlightShadows",
+		"r_csmShadows",
+		"r_csmCascadeCount",
+		"r_csmResolution",
+		"r_csmMaxDistance",
+		"r_csmSplitLambda",
+		"r_csmShadowFilter",
+		"r_csmShadowStrength",
+		"r_dlightShadowStrength",
+		"r_spotShadows",
+		"r_staticLights",
+		"r_staticLightShadows",
+		"r_surfaceLightProxies",
+
+		// Color pipeline and tone mapping.
 		"r_hdr",
+		"r_hdrPrecision",
+		"r_tonemap",
+		"r_tonemapExposure",
+		"r_srgbTextures",
+		"r_colorGrade",
+		"r_colorGradeLift",
+		"r_colorGradeGamma",
+		"r_colorGradeGain",
+		"r_colorGradeWhitePoint",
+		"r_colorGradeLUT",
+		"r_colorGradeLUTScale",
+		"r_greyscale",
+		"r_mapGreyScale",
+
+		// Bloom.
 		"r_bloom",
+		"r_bloom_intensity",
+		"r_bloom_threshold",
+		"r_bloom_threshold_mode",
+		"r_bloom_soft_knee",
+		"r_bloom_modulate",
+		"r_bloom_passes",
+		"r_bloom_blend_base",
+		"r_bloom_filter_size",
+		"r_bloom_reflection",
+
+		// Scene effects.
 		"r_depthFade",
 		"r_globalFog",
 		"r_globalFogStrength",
+		"r_flares",
+		"r_flareSize",
+		"r_motionBlur",
+		"r_motionBlurStrength",
+		"r_crt",
+		"r_crtAmount",
+		"r_crtScanlineStrength",
+		"r_crtMaskStrength",
+		"r_crtCurvature",
+		"r_crtChromatic",
+		"r_liquid",
+		"r_liquidResolution",
+		"r_liquidRefraction",
+		"r_liquidReflection",
+		"r_liquidWarpScale",
+		"r_liquidRipples",
+		"r_underwater",
+		"r_underwaterWarp",
+		"r_underwaterDispersion",
+		"r_underwaterFog",
+		"r_underwaterVignette",
+
+		// Cel shading.
 		"r_celShading",
-		"r_celShadingWorld",
 		"r_celShadingSteps",
+		"r_celShadingModelShadows",
+		"r_celViewWeapon",
+		"r_celShadingWorld",
+		"r_celShadingWorldWidth",
+		"r_celShadingWorldAlpha",
 		"r_celOutline",
-		"r_dlightMode",
-		"r_dlightShadows",
+		"r_celOutlineScale",
+		"r_celOutlineAlpha",
+		"r_celOutlineColor",
+		"r_celViewWeaponOutlineScale",
+		"r_celViewWeaponOutlineAlpha",
+
+		// Rail trail geometry.
+		"r_railWidth",
+		"r_railCoreWidth",
+		"r_railSegmentLength",
+
+		// Player highlighting.
 		"cl_playerHighlight",
 		"cl_playerHighlightRimIntensity",
 		"cl_playerHighlightOutlineIntensity",
@@ -3086,14 +3259,90 @@ static void CL_WebHost_BuildConfigCvarJson( char *buffer, size_t bufferSize ) {
 		"cl_playerHighlightRedColor",
 		"cl_playerHighlightBlueColor",
 		"cl_playerHighlightFreeColor",
+		"cl_playerHighlightTeammateColor",
+		"cl_playerHighlightEnemyColor",
+
+		// Interface presentation.
 		"cl_menuAspect",
 		"cl_menuDepthOfField",
 		"cl_menuDepthOfFieldTime",
 		"cl_cinematicAspect",
+		"com_skipIdLogo",
+		"com_introplayed",
+
+		// Console presentation.
+		"con_scale",
+		"con_scaleUniform",
+		"con_backgroundStyle",
+		"con_backgroundColor",
+		"con_backgroundOpacity",
+		"con_fade",
+		"con_scrollSmooth",
+		"con_timestamps",
+		"con_showClock",
+		"con_showVersion",
+		"con_completionPopup",
+		"con_autoClear",
+		"con_autoSay",
+		"con_sayRaw",
+		"cl_allowConsoleChat",
+
+		// Capture.
 		"cl_autoRecordDemo",
 		"cl_drawRecording",
+		"cl_demoRecordMessage",
+		"cl_aviFrameRate",
+		"cl_aviMotionJpeg",
+		"r_aviMotionJpegQuality",
+		"r_screenshotJpegQuality",
+		"r_screenshotNameFormat",
+		"r_screenshotWriteViewpos",
+		"r_screenshotWatermark",
 		"r_levelshotHideHud",
 		"r_levelshotHideViewWeapon",
+
+		// Network and frame pacing.
+		"cl_timeNudge",
+		"cl_packetdup",
+		"cl_allowDownload",
+		"cl_mapAutoDownload",
+		"com_maxfps",
+		"com_maxfpsUnfocused",
+		"com_yieldCPU",
+
+		// Mouse and gamepad input.
+		"sensitivity",
+		"m_pitch",
+		"m_filter",
+		"m_cpi",
+		"cl_mouseAccel",
+		"cl_mouseAccelOffset",
+		"cl_mouseAccelPower",
+		"cl_mouseAccelStyle",
+		"cl_mouseSensCap",
+		"cl_viewAccel",
+		"cl_freelook",
+		"in_mouse",
+		"in_joystick",
+		"in_joystickProfile",
+		"in_joystick_inverted",
+		"in_joyBallScale",
+		"joy_threshold",
+		"in_joyHorizViewSensitivity",
+		"in_joyVertViewSensitivity",
+		"in_joyHorizViewDeadzone",
+		"in_joyVertViewDeadzone",
+		"in_joyHorizMoveDeadzone",
+		"in_joyVertMoveDeadzone",
+
+		// Audio.
+		"s_volume",
+		"s_musicVolume",
+		"s_voiceVolume",
+		"s_doppler",
+		"s_pvs",
+		"s_muteWhenUnfocused",
+		"s_muteWhenMinimized",
 		"s_backend",
 		"s_alDevice",
 		"s_alHrtf",
@@ -3101,8 +3350,143 @@ static void CL_WebHost_BuildConfigCvarJson( char *buffer, size_t bufferSize ) {
 		"s_alFrequency",
 		"s_alOutputLimiter",
 		"s_alSpatializeStereo",
-		"s_muteWhenUnfocused",
-		"s_muteWhenMinimized",
+		"s_alDistanceModel",
+		"s_alMonoSources",
+		"s_alStereoSources",
+		"s_alReverb",
+		"s_alReverbGain",
+		"s_alOcclusion",
+		"s_alOcclusionStrength",
+		"s_alAirAbsorption",
+		"s_alAudioZones",
+		"s_alDopplerFactor",
+		"s_alDopplerSpeed",
+		"s_khz",
+		"s_mixAhead",
+
+		// Player identity and cgame-owned rows. The retail settings sections
+		// read every value from this snapshot, so archived module cvars have to
+		// travel with it even before qagame and cgame register them.
+		"model",
+		"headmodel",
+		"color1",
+		"color2",
+		"sex",
+		"handicap",
+		"cg_fov",
+		"cg_zoomfov",
+		"cg_zoomsensitivity",
+		"cg_zoomtoggle",
+		"cg_zoomscaling",
+		"cg_kickscale",
+		"cg_bob",
+		"cg_autoswitch",
+		"cg_switchOnEmpty",
+		"cg_switchToEmpty",
+		"cg_simpleItems",
+		"cg_flagStyle",
+		"cg_impactSparks",
+		"cg_impactSparksVelocity",
+		"cg_damagePlum",
+		"cg_damagePlumColorStyle",
+		"cg_allowTaunt",
+		"cg_deadBodyDarken",
+		"cg_autoAction",
+		"cg_teammateNames",
+		"cg_teammatePois",
+		"cg_hudFiles",
+		"cg_levelTimerDirection",
+		"cg_weaponBar",
+		"cg_drawFullWeaponBar",
+		"cg_drawAmmoWarning",
+		"cg_lowAmmoWarningSound",
+		"cg_drawItemPickups",
+		"cg_useItemMessage",
+		"cg_useItemWarning",
+		"cg_drawTeamOverlay",
+		"cg_drawFPS",
+		"cg_lagometer",
+		"cg_drawRewards",
+		"cg_speedometer",
+		"cg_drawCrosshair",
+		"cg_crosshairHealth",
+		"cg_crosshairSize",
+		"cg_crosshairColor",
+		"cg_crosshairBrightness",
+		"cg_crosshairPulse",
+		"cg_drawCrosshairNames",
+		"cg_crosshairHitStyle",
+		"cg_crosshairHitTime",
+		"cg_crosshairHitColor",
+		"cg_drawAttacker",
+		"cg_drawFragMessages",
+		"cg_powerupPois",
+		"cg_forceTeamModel",
+		"cg_forceTeamSkin",
+		"cg_teamHeadColor",
+		"cg_teamUpperColor",
+		"cg_teamLowerColor",
+		"cg_forceTeamWeaponColor",
+		"cg_screenDamage_Team",
+		"cg_screenDamageAlpha_Team",
+		"cg_forceEnemyModel",
+		"cg_forceEnemySkin",
+		"cg_enemyHeadColor",
+		"cg_enemyUpperColor",
+		"cg_enemyLowerColor",
+		"cg_forceEnemyWeaponColor",
+		"cg_screenDamage",
+		"cg_screenDamageAlpha",
+		"cg_shadows",
+		"cg_waterWarp",
+		"cg_announcer",
+		"cg_hitBeep",
+		"cg_killBeep",
+		"cg_chatBeep",
+		"cg_teamChatBeep",
+		"cg_buzzerSound",
+		"cg_voiceChatIndicator",
+		"cg_specNames",
+		"cg_followKiller",
+		"cg_followPowerup",
+		"cg_specTeamVitals",
+		"cg_specTeamVitalsHealthColor",
+		"cg_specItemTimers",
+		"cg_specFov",
+		"cg_drawInputCmds",
+		"cg_drawGun",
+		"cg_gunY",
+		"cg_muzzleFlash",
+		"cg_brassTime",
+		"cg_impactMarkTime",
+		"cg_bubbleTrail",
+		"cg_plasmaStyle",
+		"cg_rocketStyle",
+		"cg_lightningStyle",
+		"cg_lightningImpact",
+		"cg_lightningImpactCap",
+		"cg_trueLightning",
+		"cg_trueShotgun",
+		"cg_railStyle",
+		"cg_railTrailTime",
+		"cg_smoke_SG",
+		"cg_smokeRadius_GL",
+		"cg_smokeRadius_RL",
+		"cg_smokeRadius_NG",
+		"cg_weaponConfig",
+		"cg_weaponConfig_g",
+		"cg_weaponConfig_mg",
+		"cg_weaponConfig_sg",
+		"cg_weaponConfig_gl",
+		"cg_weaponConfig_rl",
+		"cg_weaponConfig_lg",
+		"cg_weaponConfig_rg",
+		"cg_weaponConfig_pg",
+		"cg_weaponConfig_hmg",
+		"cg_weaponConfig_bfg",
+		"cg_weaponConfig_ng",
+		"cg_weaponConfig_cg",
+		"cg_weaponConfig_pl",
 		NULL
 	};
 	qboolean first;
@@ -3116,14 +3500,21 @@ static void CL_WebHost_BuildConfigCvarJson( char *buffer, size_t bufferSize ) {
 	for ( int i = 0; configCvars[i]; ++i ) {
 		if ( !CL_WebHost_AppendConfigCvar( buffer, bufferSize,
 			configCvars[i], NULL, &first ) ) {
-			break;
+			// A truncated snapshot silently presents the remaining settings
+			// rows with defaults instead of the player's values, so say so.
+			Com_DPrintf( "WebUI settings snapshot truncated at '%s'; "
+				"raise CL_WEB_CONFIG_CVAR_JSON_LENGTH.\n", configCvars[i] );
+			return;
 		}
 	}
 	for ( int i = 0; cl_webStartMatchCvars[i].name; ++i ) {
 		if ( !CL_WebHost_AppendConfigCvar( buffer, bufferSize,
 			cl_webStartMatchCvars[i].name,
 			cl_webStartMatchCvars[i].value, &first ) ) {
-			break;
+			Com_DPrintf( "WebUI settings snapshot truncated at '%s'; "
+				"raise CL_WEB_CONFIG_CVAR_JSON_LENGTH.\n",
+				cl_webStartMatchCvars[i].name );
+			return;
 		}
 	}
 }
@@ -3294,7 +3685,7 @@ static qboolean CL_WebHost_AppendSteamFriendJson( char *buffer,
 	char connect[FNQL_STEAM_TEXT_CAPACITY * 2];
 	char nicknameJson[FNQL_STEAM_NAME_CAPACITY * 2 + 3];
 	char gameJson[256];
-	char item[CL_WEB_CONFIG_JSON_LENGTH];
+	char item[CL_WEB_FRIEND_ITEM_LENGTH];
 	const char *presenceText;
 
 	if ( !buffer || !friendInfo || !friendInfo->steam_id ) {
@@ -3492,8 +3883,10 @@ static void CL_WebHost_FormatSteamProfileUrl( const char *steamId, char *buffer,
 }
 
 static void CL_WebHost_BuildConfigJson( char *buffer, size_t bufferSize ) {
-	char cvarJson[CL_WEB_CONFIG_JSON_LENGTH / 2];
-	char bindJson[CL_WEB_CONFIG_JSON_LENGTH / 2];
+	// Heap-allocated so the settings snapshot can grow without putting tens of
+	// kilobytes on the stack of a per-frame path.
+	char *cvarJson = static_cast<char *>( Z_Malloc( CL_WEB_CONFIG_CVAR_JSON_LENGTH ) );
+	char *bindJson = static_cast<char *>( Z_Malloc( CL_WEB_CONFIG_BIND_JSON_LENGTH ) );
 	cgameClientIdentity_t identity;
 	unsigned int identityLow;
 	unsigned int identityHigh;
@@ -3515,7 +3908,16 @@ static void CL_WebHost_BuildConfigJson( char *buffer, size_t bufferSize ) {
 	char escapedWorkshopPolicy[128];
 	char escapedUrl[CL_WEB_CONFIG_ITEM_LENGTH];
 
-	if ( !buffer || bufferSize == 0 ) {
+	if ( !buffer || bufferSize == 0 || !cvarJson || !bindJson ) {
+		if ( buffer && bufferSize != 0 ) {
+			buffer[0] = '\0';
+		}
+		if ( cvarJson ) {
+			Z_Free( cvarJson );
+		}
+		if ( bindJson ) {
+			Z_Free( bindJson );
+		}
 		return;
 	}
 
@@ -3545,8 +3947,8 @@ static void CL_WebHost_BuildConfigJson( char *buffer, size_t bufferSize ) {
 	CL_WebUI_JsonEscape( CL_WebHost_WorkshopProviderLabel(), escapedWorkshopProvider, sizeof( escapedWorkshopProvider ) );
 	CL_WebUI_JsonEscape( CL_WebHost_WorkshopPolicyLabel(), escapedWorkshopPolicy, sizeof( escapedWorkshopPolicy ) );
 	CL_WebUI_JsonEscape( cl_webui.currentUrl, escapedUrl, sizeof( escapedUrl ) );
-	CL_WebHost_BuildConfigCvarJson( cvarJson, sizeof( cvarJson ) );
-	CL_WebHost_BuildConfigBindJson( bindJson, sizeof( bindJson ) );
+	CL_WebHost_BuildConfigCvarJson( cvarJson, CL_WEB_CONFIG_CVAR_JSON_LENGTH );
+	CL_WebHost_BuildConfigBindJson( bindJson, CL_WEB_CONFIG_BIND_JSON_LENGTH );
 
 	buffer[0] = '\0';
 	CL_WebUI_AppendJsonFormattedIfFits(
@@ -3580,6 +3982,8 @@ static void CL_WebHost_BuildConfigJson( char *buffer, size_t bufferSize ) {
 	CL_WebUI_AppendJsonLiteralIfFits( buffer, bufferSize, "},\"binds\":[" );
 	CL_WebUI_AppendJsonLiteralIfFits( buffer, bufferSize, bindJson );
 	CL_WebUI_AppendJsonLiteralIfFits( buffer, bufferSize, "]}" );
+	Z_Free( bindJson );
+	Z_Free( cvarJson );
 }
 
 static void CL_WebHost_UpdateBrowserConfigCache( const char *configJson ) {
@@ -3610,7 +4014,7 @@ static void CL_WebHost_SyncNativeSnapshots( qboolean force ) {
 	static qboolean lastCursorPositionValid = qfalse;
 	static int lastCursorX = 0;
 	static int lastCursorY = 0;
-	char configJson[CL_WEB_CONFIG_JSON_LENGTH];
+	char *configJson;
 
 	if ( !CL_WebHost_HasLiveView() || !CL_WebHost_HasBoundWindowObject() ) {
 		return;
@@ -3655,10 +4059,14 @@ static void CL_WebHost_SyncNativeSnapshots( qboolean force ) {
 		return;
 	}
 
-	CL_WebHost_BuildConfigJson( configJson, sizeof( configJson ) );
-	CL_WebHost_UpdateBrowserConfigCache( configJson );
-	cl_webui.configSnapshotSynced = qtrue;
-	cl_webui.nextConfigSnapshotFrame = cl_webui.frameSequence + CL_WEB_CONFIG_SYNC_FRAMES;
+	configJson = static_cast<char *>( Z_Malloc( CL_WEB_CONFIG_JSON_LENGTH ) );
+	if ( configJson ) {
+		CL_WebHost_BuildConfigJson( configJson, CL_WEB_CONFIG_JSON_LENGTH );
+		CL_WebHost_UpdateBrowserConfigCache( configJson );
+		Z_Free( configJson );
+		cl_webui.configSnapshotSynced = qtrue;
+		cl_webui.nextConfigSnapshotFrame = cl_webui.frameSequence + CL_WEB_CONFIG_SYNC_FRAMES;
+	}
 
 	if ( force || !cl_webui.demoSnapshotSynced ) {
 		char demoJson[CL_WEB_EVENT_PAYLOAD_LENGTH];
@@ -6086,6 +6494,36 @@ static qboolean CL_WebHost_CommandStartsGameTransition( const char *command ) {
 	return qfalse;
 }
 
+/*
+Whether a browser-originated write may reach a cvar.
+
+CVAR_PRIVATE is the secret boundary and stays closed in both directions.
+CVAR_ROM values are engine state the page only observes, so a write is refused
+rather than forced through Cvar_Set.
+
+CVAR_PROTECTED marks Quake Live engine-managed cvars. The retail settings page
+owns several of them - r_windowedMode, m_cpi, cl_mouseAccel, cl_mouseAccelOffset,
+cl_mouseAccelPower, cl_allowConsoleChat, cl_demoRecordMessage, cl_timeNudge,
+com_maxfps - and Cvar_WriteVariables routes exactly that flag to repconfig.cfg,
+so refusing those writes left the corresponding rows visibly present and inert.
+They are writable; the flag never provided a boundary here because a page can
+already run console commands through the cmd request.
+*/
+static qboolean CL_WebHost_BrowserMayWriteCvar( const char *name ) {
+	int flags;
+
+	if ( !name || !name[0] ) {
+		return qfalse;
+	}
+
+	flags = Cvar_Flags( name );
+	if ( flags == CVAR_NONEXISTENT ) {
+		return qtrue;
+	}
+
+	return ( flags & ( CVAR_PRIVATE | CVAR_ROM ) ) ? qfalse : qtrue;
+}
+
 static void CL_WebHost_ProcessNativeJavascriptRequest( const char *request ) {
 	const char *payload;
 	char kind[64];
@@ -6157,7 +6595,7 @@ static void CL_WebHost_ProcessNativeJavascriptRequest( const char *request ) {
 		}
 		Com_Memcpy( name, payload, nameLength );
 		name[nameLength] = '\0';
-		if ( Cvar_Flags( name ) & ( CVAR_PRIVATE | CVAR_PROTECTED ) ) {
+		if ( !CL_WebHost_BrowserMayWriteCvar( name ) ) {
 			return;
 		}
 
@@ -6176,7 +6614,7 @@ static void CL_WebHost_ProcessNativeJavascriptRequest( const char *request ) {
 			return;
 		}
 		Q_strncpyz( name, payload, sizeof( name ) );
-		if ( Cvar_Flags( name ) & ( CVAR_PRIVATE | CVAR_PROTECTED ) ) {
+		if ( !CL_WebHost_BrowserMayWriteCvar( name ) ) {
 			return;
 		}
 		Cvar_Reset( name );
@@ -6668,6 +7106,93 @@ static int CL_WebHost_MapMouseButton( int key ) {
 	}
 }
 
+/*
+=============
+CL_WebHost_MapVirtualKey
+
+The browser reads Windows virtual-key codes, which retail Quake Live takes
+directly from its window messages.  FnQL's platform layers have already folded
+those messages into Quake keynums, so restore the retail values here instead of
+forwarding a keynum the browser would read as an unrelated key.  Keynums no
+keyboard key produces -- mouse, wheel, joystick, gamepad, and the synthetic
+console key -- map to zero and are not forwarded.
+=============
+*/
+static unsigned int CL_WebHost_MapVirtualKey( int key ) {
+	if ( key >= 'a' && key <= 'z' ) {
+		return (unsigned int)( key - 'a' ) + 0x41u;	// VK_A..VK_Z
+	}
+	if ( key >= '0' && key <= '9' ) {
+		return (unsigned int)( key - '0' ) + 0x30u;	// VK_0..VK_9
+	}
+	if ( key >= K_F1 && key <= K_F15 ) {
+		return (unsigned int)( key - K_F1 ) + 0x70u;	// VK_F1..VK_F15
+	}
+
+	switch ( key ) {
+		case K_BACKSPACE:	return 0x08u;	// VK_BACK
+		case K_TAB:		return 0x09u;	// VK_TAB
+		case K_ENTER:		return 0x0du;	// VK_RETURN
+		case K_SHIFT:		return 0x10u;	// VK_SHIFT
+		case K_CTRL:		return 0x11u;	// VK_CONTROL
+		case K_ALT:		return 0x12u;	// VK_MENU
+		case K_PAUSE:		return 0x13u;	// VK_PAUSE
+		case K_CAPSLOCK:	return 0x14u;	// VK_CAPITAL
+		case K_ESCAPE:		return 0x1bu;	// VK_ESCAPE
+		case K_SPACE:		return 0x20u;	// VK_SPACE
+		case K_PGUP:		return 0x21u;	// VK_PRIOR
+		case K_PGDN:		return 0x22u;	// VK_NEXT
+		case K_END:		return 0x23u;	// VK_END
+		case K_HOME:		return 0x24u;	// VK_HOME
+		case K_LEFTARROW:	return 0x25u;	// VK_LEFT
+		case K_UPARROW:		return 0x26u;	// VK_UP
+		case K_RIGHTARROW:	return 0x27u;	// VK_RIGHT
+		case K_DOWNARROW:	return 0x28u;	// VK_DOWN
+		case K_PRINT:		return 0x2cu;	// VK_SNAPSHOT
+		case K_INS:		return 0x2du;	// VK_INSERT
+		case K_DEL:		return 0x2eu;	// VK_DELETE
+		case K_COMMAND:
+		case K_SUPER:		return 0x5bu;	// VK_LWIN
+		case K_MENU:		return 0x5du;	// VK_APPS
+
+		// Retail maps the keypad from its non-extended scancodes, so the
+		// browser receives the numeric keypad keys rather than the editing
+		// cluster they duplicate.
+		case K_KP_INS:		return 0x60u;	// VK_NUMPAD0
+		case K_KP_END:		return 0x61u;	// VK_NUMPAD1
+		case K_KP_DOWNARROW:	return 0x62u;	// VK_NUMPAD2
+		case K_KP_PGDN:		return 0x63u;	// VK_NUMPAD3
+		case K_KP_LEFTARROW:	return 0x64u;	// VK_NUMPAD4
+		case K_KP_5:		return 0x65u;	// VK_NUMPAD5
+		case K_KP_RIGHTARROW:	return 0x66u;	// VK_NUMPAD6
+		case K_KP_HOME:		return 0x67u;	// VK_NUMPAD7
+		case K_KP_UPARROW:	return 0x68u;	// VK_NUMPAD8
+		case K_KP_PGUP:		return 0x69u;	// VK_NUMPAD9
+		case K_KP_STAR:		return 0x6au;	// VK_MULTIPLY
+		case K_KP_PLUS:		return 0x6bu;	// VK_ADD
+		case K_KP_MINUS:	return 0x6du;	// VK_SUBTRACT
+		case K_KP_DEL:		return 0x6eu;	// VK_DECIMAL
+		case K_KP_SLASH:	return 0x6fu;	// VK_DIVIDE
+		case K_KP_ENTER:	return 0x0du;	// VK_RETURN
+		case K_KP_NUMLOCK:	return 0x90u;	// VK_NUMLOCK
+		case K_SCROLLOCK:	return 0x91u;	// VK_SCROLL
+
+		case K_SEMICOLON:	return 0xbau;	// VK_OEM_1
+		case K_EQUAL:		return 0xbbu;	// VK_OEM_PLUS
+		case K_COMMA:		return 0xbcu;	// VK_OEM_COMMA
+		case K_MINUS:		return 0xbdu;	// VK_OEM_MINUS
+		case K_DOT:		return 0xbeu;	// VK_OEM_PERIOD
+		case K_SLASH:		return 0xbfu;	// VK_OEM_2
+		case K_BRACKET_OPEN:	return 0xdbu;	// VK_OEM_4
+		case K_BACKSLASH:	return 0xdcu;	// VK_OEM_5
+		case K_BRACKET_CLOSE:	return 0xddu;	// VK_OEM_6
+		case K_QUOTE:		return 0xdeu;	// VK_OEM_7
+
+		default:
+			return 0u;
+	}
+}
+
 static int CL_WebHost_MapCursorCoordinate( int coordinate, int sourceDimension,
 	int targetDimension ) {
 	if ( sourceDimension <= 0 || targetDimension <= 0 ) {
@@ -6752,27 +7277,73 @@ void CL_WebHost_NotifyAppActivation( qboolean active ) {
 }
 
 void CL_WebView_OnKeyEvent( int key, qboolean down ) {
+	unsigned int virtualKey;
+
 	if ( !CL_WebHost_BrowserAcceptsInput() ) {
 		return;
 	}
 
-	if ( !down && cl_webui.keyCaptureArmed && !( key & K_CHAR_FLAG ) ) {
+	// Typed text arrives through CL_WebView_OnCharEvent, which carries the
+	// composed character instead of one UTF-8 byte per event.
+	if ( key & K_CHAR_FLAG ) {
+		return;
+	}
+
+	if ( !down && cl_webui.keyCaptureArmed ) {
 		CL_WebView_PublishGameKey( key );
 		cl_webui.keyCaptureArmed = qfalse;
 	}
 
-	if ( CL_WebUI_ServiceAvailable() ) {
-		if ( key & K_CHAR_FLAG ) {
-			if ( down ) {
-				CL_Awesomium_InjectKeyboardEvent( CL_WEB_KEYBOARD_EVENT_CHAR_TYPE, (unsigned int)( key & ~K_CHAR_FLAG ), 0 );
-			}
-		} else {
-			CL_Awesomium_InjectKeyboardEvent(
-				down ? CL_WEB_KEYBOARD_EVENT_KEYDOWN_TYPE : CL_WEB_KEYBOARD_EVENT_KEYUP_TYPE,
-				(unsigned int)key,
-				0 );
-		}
+	virtualKey = CL_WebHost_MapVirtualKey( key );
+	if ( virtualKey == 0u ) {
+		return;
 	}
+
+	if ( CL_WebUI_ServiceAvailable() ) {
+		CL_Awesomium_InjectKeyboardEvent(
+			down ? CL_WEB_KEYBOARD_EVENT_KEYDOWN_TYPE : CL_WEB_KEYBOARD_EVENT_KEYUP_TYPE,
+			virtualKey,
+			0 );
+	}
+}
+
+/*
+=============
+CL_WebView_OnCharEvent
+
+Retail text fields, including the Match Browser filter, are driven by character
+events rather than by key codes.  The browser consumes UTF-16, so a code point
+outside the BMP is delivered as its surrogate pair exactly as the equivalent
+Windows character messages would be.
+=============
+*/
+void CL_WebView_OnCharEvent( int codepoint ) {
+	unsigned int scalar;
+
+	if ( !CL_WebHost_BrowserAcceptsInput() || codepoint <= 0 ) {
+		return;
+	}
+
+	scalar = (unsigned int)codepoint;
+	if ( scalar > 0x10ffffu || ( scalar >= 0xd800u && scalar <= 0xdfffu ) ) {
+		return;
+	}
+
+	if ( !CL_WebUI_ServiceAvailable() ) {
+		return;
+	}
+
+	if ( scalar >= 0x10000u ) {
+		const unsigned int supplementary = scalar - 0x10000u;
+
+		CL_Awesomium_InjectKeyboardEvent( CL_WEB_KEYBOARD_EVENT_CHAR_TYPE,
+			0xd800u + ( supplementary >> 10 ), 0 );
+		CL_Awesomium_InjectKeyboardEvent( CL_WEB_KEYBOARD_EVENT_CHAR_TYPE,
+			0xdc00u + ( supplementary & 0x3ffu ), 0 );
+		return;
+	}
+
+	CL_Awesomium_InjectKeyboardEvent( CL_WEB_KEYBOARD_EVENT_CHAR_TYPE, scalar, 0 );
 }
 
 qboolean CL_Awesomium_RequestResource( const char *virtualPath, void **outBuffer, int *outLength ) {

@@ -33,6 +33,8 @@ These settings control the actual game window or fullscreen mode. Treat them as 
   - `0`: Do not wait for v-blank.
   - `1`: Sync swaps to the monitor refresh rate.
 
+Fullscreen picks one of two forms automatically. A request that matches the current desktop resolution with `r_displayRefresh 0` uses borderless desktop fullscreen: no display mode change, so alt-tab, other monitors, and the desktop layout are left alone. Any other resolution, or an explicit `r_displayRefresh`, switches the display to the closest matching mode at or above the requested size. The console line `...fullscreen <width>x<height>@<rate>Hz (exclusive|desktop)` reports what was actually applied; if no mode is large enough for the request, the engine says so and falls back to desktop fullscreen.
+
 Practical setups:
 
 - Exclusive fullscreen at desktop resolution:
@@ -391,6 +393,30 @@ This is an intentionally inexpensive screen-space effect, not a second mirrored 
 
 For the pass ordering, backend tiers, dedicated snapshot, and compatibility invariants, see [Liquid Rendering](fnql/LIQUID_RENDERING.md).
 
+## Underwater View
+
+While the camera is under water, slime, or lava, the OpenGL-lineage renderers, including GLx, and the Vulkan renderers can composite a submerged view over the finished scene: an animated screen warp with a slight colour separation, a darkened periphery, and a medium tint that deepens with distance. It is the view-side counterpart to Enhanced Liquids above — that setting draws water seen from outside, this one draws the world seen from inside it — and the two are independent. The layer defaults to off, so existing configurations and demos keep the classic presentation unless you opt in.
+
+- `r_underwater` enables the layer for all three liquid types. The default is `0`. This setting is latched.
+- `r_underwaterWarp` multiplies the wave distortion, from `0.0` to `2.0` with a default of `1.0` (about `11` pixels at 1080 lines before the liquid's own multiplier). The distortion is scaled to the view height so it keeps the same angular size at every resolution. `0` flattens the warp.
+- `r_underwaterDispersion` sets how far the red and blue channels separate across the warp, from `0.0` to `1.0` with a default of `0.35`. `0` keeps all three channels aligned.
+- `r_underwaterFog` scales the distance tint, from `0.0` to `1.0` with a default of `1.0`. The colour and how quickly it closes in follow the liquid: water stays readable at short range, slime loses the scene within a room, and lava is nearly opaque. `0` disables the tint.
+- `r_underwaterVignette` sets the edge darkening, from `0.0` to `1.0` with a default of `0.35`. `0` leaves the periphery at full brightness.
+
+Entering and leaving a liquid ramps the whole layer over about a fifth of a second, so a surface crossing does not pop. The HUD and console are drawn after the layer and stay sharp. The distance tint needs a usable depth texture; without one the warp and edge darkening still apply.
+
+The effect requires `r_fbo 1`. Changing `r_underwater` allocates renderer resources, so issue `vid_restart` after changing it. The other four settings can be tuned live. A balanced starting point is:
+
+```cfg
+seta r_fbo "1"
+seta r_underwater "1"
+vid_restart
+```
+
+This is a post-process on the frame that has already been rendered, not a refracted re-render of the world. It bends and tints what was visible rather than revealing anything new, the screen border is stretched rather than filled, and there are no caustics, light shafts, or bubbles. Crossing the waterline switches the medium at the eye instead of splitting the view into above-surface and below-surface halves. Nothing about the layer touches collision, buoyancy, movement, projectile paths, networking, game logic, or demo state.
+
+For the submersion feed, pass ordering, backend tiers, and compatibility invariants, see [Underwater View](fnql/UNDERWATER_VIEW.md).
+
 ## Optional Global Fog
 
 Map authors and mods can add a visual-only, depth-aware atmospheric layer with a `maps/<map>.fog` sidecar. FnQL does not ship map fog profiles, and the feature does not replace authored BSP fog or affect visibility, collision, game state, networking, demos, or module ABIs.
@@ -591,6 +617,7 @@ Use `vid_restart` after changes to:
 - Vulkan `r_bloom`
 - Vulkan `r_motionBlur`
 - `r_liquid` or `r_liquidResolution`
+- `r_underwater`
 
 For pure window-state changes (`r_fullscreen`, `r_mode`, `r_noborder`, window size or position), prefer `vid_restart fast`: it applies the change on the existing window when possible and falls back to a full restart automatically. See [Fast Windowed/Fullscreen Toggle](#fast-windowedfullscreen-toggle).
 

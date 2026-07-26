@@ -1077,7 +1077,12 @@ static const char kLiquidFragmentSource[] =
 	"            && texture2D(u_Texture1, sampleUv).r < gl_FragCoord.z - 0.00003)\n"
 	"            sampleUv = uv;\n"
 	"        vec3 sceneColor = texture2D(u_Texture0, sampleUv).rgb;\n"
-	"        float alpha = typeScale * clamp(u_Params.z, 0.0, 1.0);\n"
+	/* The underlay replaces the background at the liquid type's own opacity
+	 * rather than blending a warped copy over the unwarped one: a partial
+	 * blend of two different taps is a smear, not a refraction.
+	 * r_liquidRefraction scales the displacement instead, and reaches the
+	 * shader already folded into the warp pixels and ripple amplitudes. */
+	"        float alpha = typeScale;\n"
 	"        gl_FragColor = vec4(sceneColor, alpha);\n"
 	"    }\n"
 	"    else\n"
@@ -1085,9 +1090,14 @@ static const char kLiquidFragmentSource[] =
 	/* Bounded single-tap screen-space reflection of the immutable pre-
 	 * transparency snapshot; the material sheen color is the fallback
 	 * wherever the mirrored sample is invalid or leaves the screen. */
-	"        vec3 waveNormal = normalize(normal + vec3(waveGradient * 0.12, 0.0));\n"
+	"        vec3 tangentRef = abs(normal.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);\n"
+	"        vec3 tangent = normalize(cross(tangentRef, normal));\n"
+	"        vec3 bitangent = cross(normal, tangent);\n"
+	"        vec3 waveNormal = normalize(normal\n"
+	"            + (tangent * waveGradient.x + bitangent * waveGradient.y) * 0.12);\n"
 	"        float fresnel = 1.0 - abs(dot(waveNormal, viewDirection));\n"
-	"        fresnel *= fresnel;\n"
+	"        float fresnel2 = fresnel * fresnel;\n"
+	"        fresnel = fresnel2 * fresnel2 * fresnel;\n"
 	"        vec3 reflected = reflect(-viewDirection, waveNormal);\n"
 	"        vec4 reflectedClip = gl_ModelViewProjectionMatrix\n"
 	"            * vec4(v_Position + reflected * (384.0 + 0.75 * viewLength), 1.0);\n"

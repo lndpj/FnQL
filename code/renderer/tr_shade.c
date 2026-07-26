@@ -1982,16 +1982,23 @@ static void RB_DrawLiquidPass( shaderCommands_t *input, qboolean refractionBase 
 	rbLiquidRipple_t ripples[LIQUID_MAX_ACTIVE_IMPULSES];
 	const float time = R_LiquidWaveTime( backEnd.refdef.floatTime );
 	const float heightScale = R_LiquidViewHeightScale( backEnd.viewParms.viewportHeight );
-	/* R_LiquidWarpPixels maps the archived cvar through LIQUID_WARP_TO_PIXELS
-	 * and scales it to the active viewport height. */
-	const float warpPixels = R_LiquidWarpPixels( r_liquidWarpScale ? r_liquidWarpScale->value : 0.0f,
-		backEnd.viewParms.viewportHeight );
 	const float fresnelStrength = r_liquidReflection ? r_liquidReflection->value : 0.0f;
 	const float refractionStrength = r_liquidRefraction ? r_liquidRefraction->value : 1.0f;
 	const float rippleStrength = r_liquidRipples ? r_liquidRipples->value : 0.0f;
 	const float typeScale = R_LiquidContentsReflectionScale( input->liquidContentFlags );
 	const float passStrength = Com_Clamp( 0.0f, 1.0f,
 		refractionBase ? refractionStrength : fresnelStrength );
+	/* r_liquidRefraction scales how far the underlay bends the view, not how
+	 * much of the warped copy is mixed with the unwarped destination: mixing
+	 * two different taps produces a two-tap smear instead of a refraction. The
+	 * underlay therefore draws at the liquid type's own opacity and the cvar
+	 * is folded into the displacement here, once, for every backend tier. */
+	const float refractionScale = refractionBase ? passStrength : 1.0f;
+	/* R_LiquidWarpPixels maps the archived cvar through LIQUID_WARP_TO_PIXELS
+	 * and scales it to the active viewport height. */
+	const float warpPixels = R_LiquidWarpPixels( r_liquidWarpScale ? r_liquidWarpScale->value : 0.0f,
+		backEnd.viewParms.viewportHeight ) * refractionScale;
+	const float passAlpha = refractionBase ? typeScale : ( typeScale * passStrength );
 	const float reflectivity = backEnd.liquidScreenMapDone ? LIQUID_REFLECT_INTENSITY : 0.0f;
 	vec3_t fresnelColor;
 	GLboolean previousColorMask[4];
@@ -2032,10 +2039,14 @@ static void RB_DrawLiquidPass( shaderCommands_t *input, qboolean refractionBase 
 			life = 1.0f - age * ( 1000.0f / (float)LIQUID_IMPULSE_LIFETIME_MSEC );
 			R_LiquidWorldToLocal( interaction->origin, backEnd.or.origin,
 				backEnd.or.axis, ripples[rippleCount].center );
-			ripples[rippleCount].radius = interaction->radius + age * 150.0f;
-			ripples[rippleCount].width = 20.0f + interaction->radius * 0.35f;
+			ripples[rippleCount].radius = interaction->radius +
+				age * LIQUID_RIPPLE_EXPAND_SPEED;
+			/* Same band as the per-fragment shaders: it widens with the
+			 * expanded radius, not with the impulse's original size. */
+			ripples[rippleCount].width = LIQUID_RIPPLE_WIDTH_BASE +
+				ripples[rippleCount].radius * LIQUID_RIPPLE_WIDTH_SCALE;
 			ripples[rippleCount].amplitude = interaction->strength * rippleStrength * life *
-				LIQUID_RIPPLE_PIXEL_SCALE * heightScale;
+				LIQUID_RIPPLE_PIXEL_SCALE * heightScale * refractionScale;
 			rippleCount++;
 		}
 	}
@@ -2076,9 +2087,10 @@ static void RB_DrawLiquidPass( shaderCommands_t *input, qboolean refractionBase 
 	 * modes see exactly the value produced by the authored scene. */
 	GL_ProgramDisable();
 	GLX_CompatUnbindMaterial();
-	if ( refractionBase ) {
-		FBO_BindLiquidDepthTexture( 1 );
-	}
+	/* Bind unit 1 for both passes: the liquid program declares u_Texture1 even
+	 * though only the refraction branch samples it, and leaving whatever the
+	 * previous authored stage left there makes the sampler binding undefined. */
+	FBO_BindLiquidDepthTexture( 1 );
 	GL_SelectTexture( 0 );
 	GL_BindTexNum( FBO_LiquidScreenTexture() );
 	GL_TexEnv( GL_MODULATE );
@@ -2106,7 +2118,7 @@ static void RB_DrawLiquidPass( shaderCommands_t *input, qboolean refractionBase 
 		VectorCopy( backEnd.or.viewOrigin, arb.eyePos );
 		arb.wrappedTime = time;
 		arb.warpPixels = warpPixels;
-		arb.alphaScale = typeScale * passStrength;
+		arb.alphaScale = passAlpha;
 		arb.reflectivity = reflectivity;
 		arb.depthAvailable = FBO_LiquidDepthReady();
 		VectorCopy( fresnelColor, arb.fresnelColor );
@@ -2147,6 +2159,9 @@ static void RB_DrawLiquidPass( shaderCommands_t *input, qboolean refractionBase 
 		vec4_t *screen = &rb_liquidTexcoords[i];
 		vec3_t normal;
 		vec3_t view;
+		vec3_t tangent;
+		vec3_t bitangent;
+		vec3_t waveNormal;
 		float normalLength;
 		float viewLength;
 		float gradientX;
@@ -2203,13 +2218,20 @@ static void RB_DrawLiquidPass( shaderCommands_t *input, qboolean refractionBase 
 				(float)MAX( 1, backEnd.viewParms.viewportHeight ) ) * (*screen)[3];
 
 		if ( refractionBase ) {
-			alpha = typeScale * passStrength;
+			alpha = passAlpha;
 		} else {
-			fresnel = 1.0f - fabsf( DotProduct( normal, view ) );
-			fresnel = Com_Clamp( 0.0f, 1.0f, fresnel );
-			fresnel *= fresnel;
-			alpha = typeScale * passStrength *
-				Com_Clamp( 0.0f, 0.60f, LIQUID_FRESNEL_ALPHA_BASE +
+			/* Flat-sheen fallback: no reflection tap, but the same
+			 * tangent-plane wave perturbation and Schlick curve the
+			 * programmable tiers use, so the sheen still moves with the waves
+			 * instead of tracking the view angle alone. */
+			R_LiquidTangentFrame( normal, tangent, bitangent );
+			VectorMA( normal, gradientX * LIQUID_NORMAL_PERTURB, tangent, waveNormal );
+			VectorMA( waveNormal, gradientY * LIQUID_NORMAL_PERTURB, bitangent,
+				waveNormal );
+			VectorNormalize( waveNormal );
+			fresnel = R_LiquidFresnel( DotProduct( waveNormal, view ) );
+			alpha = passAlpha *
+				Com_Clamp( 0.0f, LIQUID_FRESNEL_ALPHA_MAX, LIQUID_FRESNEL_ALPHA_BASE +
 					fresnel * LIQUID_FRESNEL_ALPHA_SPAN );
 		}
 		rb_liquidColors[i].rgba[0] = refractionBase ? 255 : (byte)( fresnelColor[0] * 255.0f + 0.5f );

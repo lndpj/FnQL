@@ -630,17 +630,29 @@ if win32
   else
     rc_prog = find_program('rc', 'llvm-rc', 'windres', required: false)
   endif
+  # Neither resource compiler emits a depfile, so the files the script pulls in
+  # have to be listed explicitly. Without this an edit to the DPI manifest, the
+  # icon, or the version header leaves the previous resource blob linked in and
+  # the change appears to have no effect until the build tree is wiped.
+  win_resource_deps = files(
+    'code/win32/q3.manifest',
+    'code/win32/resource.h',
+    'code/win32/fnql.ico',
+    'version/fnql_version.h',
+  )
   if rc_prog.found()
     if rc_prog.full_path().to_lower().contains('windres')
       win_resource = custom_target('win_resource',
         input: 'code/win32/win_resource.rc',
         output: 'win_resource.o',
+        depend_files: win_resource_deps,
         command: [rc_prog, '-i', '@INPUT@', '-o', '@OUTPUT@', '--include-dir', meson.project_source_root()],
       )
     else
       win_resource = custom_target('win_resource',
         input: 'code/win32/win_resource.rc',
         output: 'win_resource.res',
+        depend_files: win_resource_deps,
         command: [rc_prog, '/fo', '@OUTPUT@', '/I', meson.project_source_root(), '@INPUT@'],
       )
     endif
@@ -899,7 +911,6 @@ endforeach
 root_package_assets = stock_audio_zone_sidecars + stock_global_fog_sidecars + files(
   'pkg/baseq3/scripts/fnql.shader',
   'pkg/baseq3/sound/fnql-weapon-sounds.sndshd',
-  'pkg/missionpack/sound/fnql-weapon-sounds.sndshd',
 )
 
 custom_target('FnQL-pkg.fnz',
@@ -976,6 +987,13 @@ if get_option('audio-tests')
   )
   test('fnql_audio_occlusion', audio_occlusion_tests)
 
+  audio_tone_tests = executable('fnql_audio_tone_tests',
+    'tests/audio/tone_policy_tests.cpp',
+    include_directories: include_directories('code/client/audio/shared'),
+    cpp_args: common_cpp_args,
+  )
+  test('fnql_audio_tone', audio_tone_tests)
+
   audio_voice_queue_tests = executable('fnql_audio_voice_queue_tests',
     'tests/audio/voice_queue_tests.cpp',
     include_directories: include_directories('code/client/audio/shared'),
@@ -985,6 +1003,10 @@ if get_option('audio-tests')
 
   test('fnql_retail_sound_compat_source', python,
     args: files('tests/audio/retail_sound_compat_source_tests.py'),
+  )
+
+  test('fnql_audio_impact_occlusion_source', python,
+    args: files('tests/audio/impact_occlusion_source_tests.py'),
   )
 
   audio_loopback_tests = executable('fnql_audio_loopback_tests',
@@ -1260,6 +1282,16 @@ test('fnql_retail_factory_probe', python,
 test('fnql_steam_provider_source', python,
   args: files('tests/steam_provider_source_tests.py'),
 )
+
+steam_identity_tests = executable('fnql_steam_identity_tests',
+  'tests/steam_identity_tests.cpp',
+  cpp_args: common_cpp_args,
+)
+test('fnql_steam_identity', steam_identity_tests)
+test('fnql_steam_identity_source', python,
+  args: files('tests/steam_identity_source_tests.py'),
+)
+
 test('fnql_workshop_source', python,
   args: files('tests/workshop_source_tests.py'),
 )

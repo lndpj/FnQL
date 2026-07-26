@@ -92,6 +92,7 @@ against the existing renderers.
 | `r_globalFog` | `0` | Do not load or apply optional map fog sidecars by default. |
 | `r_fogMode` | `0` | Preserve the legacy BSP fog lookup unless analytic fog is selected explicitly. |
 | `r_liquid` | `0` | Preserve authored liquid stages without the enhanced screen-space layer by default. |
+| `r_underwater` | `0` | Keep the classic dry presentation while submerged unless the submerged-view compositor is requested. |
 | `r_hdr` | `0` | Preserve the SDR presentation path by default. |
 | `r_surfaceLightProxies` | `0` | Do not infer analytic emitters from compiled surface-light metadata by default. |
 

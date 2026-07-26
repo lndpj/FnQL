@@ -39,9 +39,13 @@ vec2 LiquidWaveGradient(vec3 position, float time)
 
 void main()
 {
-	vec3 normal = normalize(frag_normal);
-	vec3 view_dir = normalize(frag_view);
+	/* A degenerate normal or an eye exactly on the surface must not turn the
+	 * whole fragment into NaN; the GLx GLSL and the per-vertex fallback
+	 * substitute the same values. */
+	float normal_length = length(frag_normal);
+	vec3 normal = normal_length > 0.000001 ? frag_normal / normal_length : vec3(0.0, 0.0, 1.0);
 	float view_length = length(frag_view);
+	vec3 view_dir = view_length > 0.000001 ? frag_view / view_length : normal;
 	vec2 wave_gradient = LiquidWaveGradient(frag_position, liquid_params.x);
 
 	if (liquid_info.w > 0.5) {
@@ -82,15 +86,25 @@ void main()
 			&& texture(scene_depth, sample_uv).r > gl_FragCoord.z + 0.00003)
 			sample_uv = uv;
 		vec3 scene = texture(scene_color, sample_uv).rgb;
-		float alpha = liquid_info.x * clamp(liquid_params.z, 0.0, 1.0);
+		/* The underlay replaces the background at the liquid type's own
+		 * opacity rather than blending a warped copy over the unwarped one:
+		 * a partial blend of two different taps is a smear, not a refraction.
+		 * r_liquidRefraction scales the displacement instead, and reaches the
+		 * shader already folded into the warp pixels and ripple amplitudes. */
+		float alpha = liquid_info.x;
 		out_color = vec4(scene, alpha);
 	} else {
 		/* Bounded single-tap screen-space reflection of the immutable pre-
 		 * transparency snapshot; the material sheen color is the fallback
 		 * wherever the mirrored sample is invalid or leaves the screen. */
-		vec3 wave_normal = normalize(normal + vec3(wave_gradient * 0.12, 0.0));
+		vec3 tangent_ref = abs(normal.z) < 0.9 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+		vec3 tangent = normalize(cross(tangent_ref, normal));
+		vec3 bitangent = cross(normal, tangent);
+		vec3 wave_normal = normalize(normal
+			+ (tangent * wave_gradient.x + bitangent * wave_gradient.y) * 0.12);
 		float fresnel = 1.0 - abs(dot(wave_normal, view_dir));
-		fresnel *= fresnel;
+		float fresnel2 = fresnel * fresnel;
+		fresnel = fresnel2 * fresnel2 * fresnel;
 		vec3 reflected = reflect(-view_dir, wave_normal);
 		vec4 reflected_clip = liquid_mvp
 			* vec4(frag_position + reflected * (384.0 + 0.75 * view_length), 1.0);

@@ -146,6 +146,51 @@ void TestStrictDirectivesAndBounds()
 	CHECK( R_GlobalFogParse( nullptr, valid, sizeof( valid ) - 1, nullptr, 0 ) == qfalse );
 }
 
+void TestSceneColorMatchesOutputTransform()
+{
+	globalFog_t fog{};
+	vec3_t scene{};
+
+	CHECK( Parse( "color 0.5 0.25 1 density .001", &fog ) == qtrue );
+
+	/* The compositor blends into the scene buffer, which the output transform
+	 * still multiplies by the overbright scale.  Authored colors are
+	 * display-referred, so they have to be divided by that scale first;
+	 * skipping this renders an authored mid-grey as white. */
+	R_GlobalFogSceneColor( &fog, 2.0f, qfalse, scene );
+	CHECK( scene[0] == 0.25f );
+	CHECK( scene[1] == 0.125f );
+	CHECK( scene[2] == 0.5f );
+
+	R_GlobalFogSceneColor( &fog, 1.0f, qfalse, scene );
+	CHECK( scene[0] == 0.5f );
+	CHECK( scene[1] == 0.25f );
+	CHECK( scene[2] == 1.0f );
+
+	/* A non-positive scale must not divide by zero or invert the color. */
+	R_GlobalFogSceneColor( &fog, 0.0f, qfalse, scene );
+	CHECK( scene[0] == 0.5f );
+	R_GlobalFogSceneColor( &fog, -4.0f, qfalse, scene );
+	CHECK( scene[0] == 0.5f );
+
+	/* The scene-linear buffer additionally needs the authored sRGB value
+	 * linearized before the same output scale is removed. */
+	R_GlobalFogSceneColor( &fog, 2.0f, qtrue, scene );
+	CHECK( scene[0] > 0.1069f && scene[0] < 0.1079f );
+	CHECK( scene[1] > 0.0246f && scene[1] < 0.0256f );
+	CHECK( scene[2] == 0.5f );
+
+	CHECK( R_GlobalFogSrgbToLinear( 0.0f ) == 0.0f );
+	CHECK( R_GlobalFogSrgbToLinear( -1.0f ) == 0.0f );
+	CHECK( R_GlobalFogSrgbToLinear( 1.0f ) == 1.0f );
+	CHECK( R_GlobalFogSrgbToLinear( 2.0f ) == 1.0f );
+	CHECK( R_GlobalFogSrgbToLinear( 0.04f ) > 0.0030f );
+	CHECK( R_GlobalFogSrgbToLinear( 0.04f ) < 0.0032f );
+
+	R_GlobalFogSceneColor( nullptr, 2.0f, qfalse, scene );
+	R_GlobalFogSceneColor( &fog, 2.0f, qfalse, nullptr );
+}
+
 } // namespace
 
 int main()
@@ -154,5 +199,6 @@ int main()
 	TestExplicitModesAndBooleans();
 	TestRequiredFieldsAndRanges();
 	TestStrictDirectivesAndBounds();
+	TestSceneColorMatchesOutputTransform();
 	return 0;
 }

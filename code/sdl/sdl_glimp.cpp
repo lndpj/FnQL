@@ -459,29 +459,44 @@ Switch the window into the requested fullscreen mode and refresh the
 reported display frequency.
 ===============
 */
-static qboolean GLW_ApplyFullscreen( glconfig_t *config, SDL_DisplayID display, int colorBits )
+static qboolean GLW_ApplyFullscreen( glconfig_t *config, SDL_DisplayID display )
 {
 	SDL_DisplayMode mode;
+	const SDL_DisplayMode *desktopMode;
 	const SDL_DisplayMode *currentMode;
 	SDL_DisplayID fullscreenDisplay;
+	const int refreshRate = Cvar_VariableIntegerValue( "r_displayRefresh" );
+	qboolean exclusive;
 
-	SDL_zero( mode );
-	mode.displayID = display;
-
-	switch ( colorBits )
-	{
-		case 16: mode.format = SDL_PIXELFORMAT_RGB565; break;
-		case 24: mode.format = SDL_PIXELFORMAT_RGB24;  break;
-		default:
-			Com_DPrintf( "colorBits is %d, can't fullscreen\n", colorBits );
-			return qfalse;
+	if ( !display ) {
+		display = SDL_GetDisplayForWindow( SDL_window );
 	}
 
-	mode.w = config->vidWidth;
-	mode.h = config->vidHeight;
-	mode.refresh_rate = /* config->displayFrequency = */ Cvar_VariableIntegerValue( "r_displayRefresh" );
+	SDL_zero( mode );
 
-	if ( !GLW_EnterFullscreen( SDL_window, &mode ) ) {
+	// A desktop-sized request without a refresh override needs no mode switch.
+	// Borderless desktop fullscreen keeps alt-tab, multi-monitor layout and
+	// gamma intact, and cannot be refused by the driver.
+	desktopMode = display ? SDL_GetDesktopDisplayMode( display ) : NULL;
+	exclusive = ( refreshRate > 0 || !desktopMode ||
+		desktopMode->w != config->vidWidth ||
+		desktopMode->h != config->vidHeight ) ? qtrue : qfalse;
+
+	if ( exclusive && display ) {
+		// SDL only accepts a mode taken from the display's own list, so the
+		// request has to be resolved against it. A mode we describe ourselves
+		// never compares equal - its pixel format and refresh rate cannot be
+		// guessed - and would silently demote every fullscreen switch to
+		// desktop resolution.
+		if ( !SDL_GetClosestFullscreenDisplayMode( display, config->vidWidth,
+			config->vidHeight, (float)refreshRate, false, &mode ) ) {
+			Com_Printf( "...no fullscreen mode matches %dx%d: %s\n",
+				config->vidWidth, config->vidHeight, SDL_GetError() );
+			SDL_zero( mode );
+		}
+	}
+
+	if ( !GLW_EnterFullscreen( SDL_window, mode.w > 0 ? &mode : NULL ) ) {
 		return qfalse;
 	}
 
@@ -497,6 +512,10 @@ static qboolean GLW_ApplyFullscreen( glconfig_t *config, SDL_DisplayID display, 
 			config->displayFrequency = currentMode->refresh_rate;
 		}
 	}
+
+	Com_Printf( "...fullscreen %dx%d@%dHz (%s)\n",
+		glw_state.pixel_width, glw_state.pixel_height, config->displayFrequency,
+		SDL_GetWindowFullscreenMode( SDL_window ) ? "exclusive" : "desktop" );
 
 	return qtrue;
 }
@@ -641,7 +660,7 @@ static qboolean GLW_ReuseExistingWindow( glconfig_t *config, SDL_DisplayID displ
 
 	if ( fullscreen )
 	{
-		if ( !GLW_ApplyFullscreen( config, display, colorBits ) ) {
+		if ( !GLW_ApplyFullscreen( config, display ) ) {
 			return qfalse;
 		}
 	}
@@ -976,7 +995,7 @@ static rserr_t GLW_SetMode( int mode, const char *modeFS, qboolean fullscreen, q
 
 		if ( fullscreen )
 		{
-			if ( !GLW_ApplyFullscreen( config, display, testColorBits ) ) {
+			if ( !GLW_ApplyFullscreen( config, display ) ) {
 				GLW_DestroyWindow();
 				continue;
 			}

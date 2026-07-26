@@ -24,6 +24,15 @@ constexpr float kProbeSpreadMinimum = 10.0f;
 constexpr float kProbeSpreadMaximum = 28.0f;
 constexpr float kPartialOcclusionBias = 0.18f;
 constexpr float kCenterBlockedMinimum = 0.55f;
+// Impact and explosion events are emitted exactly on the surface they hit, and
+// the network origin snap can leave them a fraction of a unit inside it. Lift
+// the direct-path sample clear of that surface before tracing so a detonation
+// in plain sight is not measured against the geometry it is resting on. Both
+// steps stay under half the thinnest structural brush a map is built from, so
+// the sample can never travel through a wall to the listener's side.
+constexpr float kSurfaceBias = 2.0f;
+constexpr float kSurfaceEscape = 4.0f;
+constexpr float kThinnestStructuralBrush = 8.0f;
 
 constexpr float kDirectAttenuation = 0.72f;
 constexpr float kDirectGainMinimum = 0.18f;

@@ -87,6 +87,57 @@ class WindowManagementSourceTests(unittest.TestCase):
         self.assertIn("CL_Awesomium_Resize( desired.width, desired.height )", webui)
         self.assertIn("requestedSurfaceSize", webui)
 
+    def test_fullscreen_mode_comes_from_the_display_mode_list(self) -> None:
+        glimp = read_text("code/sdl/sdl_glimp.cpp")
+
+        # A hand-built SDL_DisplayMode never compares equal to an enumerated one,
+        # so SDL rejects it and every fullscreen switch silently degrades to
+        # desktop resolution. The request has to be resolved against the display.
+        self.assertIn(
+            "SDL_GetClosestFullscreenDisplayMode( display, config->vidWidth,", glimp
+        )
+        self.assertNotIn("SDL_PIXELFORMAT_RGB24", glimp)
+        self.assertNotIn("mode.w = config->vidWidth;", glimp)
+
+        # Desktop-sized requests must stay on borderless desktop fullscreen so
+        # the default configuration performs no display mode change.
+        self.assertIn("desktopMode->w != config->vidWidth", glimp)
+        self.assertIn("desktopMode->h != config->vidHeight", glimp)
+        self.assertIn('r_displayRefresh', glimp)
+
+    def test_windows_resource_rebuilds_when_the_manifest_changes(self) -> None:
+        build = read_text("meson.build")
+
+        # Neither rc nor windres emits a depfile. Without depend_files a manifest
+        # or icon edit leaves the previous resource blob linked in, so the change
+        # silently does nothing until the build tree is wiped.
+        self.assertIn("win_resource_deps = files(", build)
+        for dependency in (
+            "code/win32/q3.manifest",
+            "code/win32/resource.h",
+            "code/win32/fnql.ico",
+            "version/fnql_version.h",
+        ):
+            self.assertIn(f"'{dependency}'", build)
+        self.assertEqual(2, build.count("depend_files: win_resource_deps"))
+
+    def test_windows_manifest_declares_per_monitor_v2_dpi_awareness(self) -> None:
+        manifest = read_text("code/win32/q3.manifest")
+        glimp = read_text("code/win32/win_glimp.cpp")
+
+        # Per-Monitor V1 blocks the awareness level SDL requests for itself and
+        # the one its window sizing assumes.
+        self.assertIn("PerMonitorV2", manifest)
+        self.assertIn(
+            "http://schemas.microsoft.com/SMI/2016/WindowsSettings", manifest
+        )
+
+        # A DPI-aware process already reports monitor rects in physical pixels.
+        # Replacing the extent with the driver mode while keeping the monitor
+        # origin desynchronizes fullscreen geometry.
+        self.assertNotIn("w = devMode.dmPelsWidth;", glimp)
+        self.assertNotIn("h = devMode.dmPelsHeight;", glimp)
+
     def test_native_windows_supports_snap_dpi_and_work_area_recovery(self) -> None:
         local = read_text("code/win32/win_local.h")
         glimp = read_text("code/win32/win_glimp.cpp")

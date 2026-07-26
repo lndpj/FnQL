@@ -75,6 +75,32 @@ bool PartialOcclusionDoesNotBecomeBinary() {
 	return true;
 }
 
+bool SurfaceMountedSourcesSampleClearOfTheirImpactPlane() {
+	// Impact and explosion origins rest on the surface they hit, so the direct
+	// path has to be sampled from just clear of it.
+	CHECK( occ::kSurfaceBias > 0.0f );
+	CHECK( occ::kSurfaceEscape > occ::kSurfaceBias );
+	// Neither step may carry the sample through a wall to the listener's side,
+	// which would turn a genuinely blocked source into an audible one.
+	CHECK( occ::kSurfaceEscape * 2.0f <= occ::kThinnestStructuralBrush );
+	CHECK( occ::kSurfaceEscape < occ::kProbeSpreadMinimum );
+	return true;
+}
+
+bool DiscardedProbesDoNotCountAsObstructions() {
+	// Probes buried in the impact surface are dropped from the sample set
+	// instead of counted as blocked, so a detonation in plain sight against a
+	// floor or corner stays unoccluded on a reduced fan.
+	CHECK( Near( occ::OcclusionFromProbeHits( 0, 3, false ), 0.0f ) );
+	CHECK( Near( occ::OcclusionFromProbeHits( 0, 1, false ), 0.0f ) );
+	CHECK( occ::DirectGain( occ::OcclusionFromProbeHits( 0, 3, false ) ) > 0.99f );
+	// Counting those same probes as obstructions is what buried explosions.
+	CHECK( occ::DirectGain( occ::OcclusionFromProbeHits( 2, 5, false ) ) < 0.75f );
+	// A genuinely blocked path still reads as fully occluded on a reduced fan.
+	CHECK( Near( occ::OcclusionFromProbeHits( 3, 3, true ), 1.0f ) );
+	return true;
+}
+
 bool StrengthAndWetRoutingClampPredictably() {
 	const float partial = occ::OcclusionFromProbeHits( 2, 5, false );
 	CHECK( Near( occ::ApplyStrength( partial, 0.0f ), 0.0f ) );
@@ -97,6 +123,8 @@ int main() {
 		{ "CenterObstructionStaysAudibleInThePolicy", CenterObstructionStaysAudibleInThePolicy },
 		{ "FullOcclusionHasAGainOnlyFallback", FullOcclusionHasAGainOnlyFallback },
 		{ "PartialOcclusionDoesNotBecomeBinary", PartialOcclusionDoesNotBecomeBinary },
+		{ "SurfaceMountedSourcesSampleClearOfTheirImpactPlane", SurfaceMountedSourcesSampleClearOfTheirImpactPlane },
+		{ "DiscardedProbesDoNotCountAsObstructions", DiscardedProbesDoNotCountAsObstructions },
 		{ "StrengthAndWetRoutingClampPredictably", StrengthAndWetRoutingClampPredictably }
 	};
 

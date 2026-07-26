@@ -539,6 +539,11 @@ qboolean CL_IsVoiceSenderMuted( int clientNum );
 void CL_SetClientSpeakingState( int clientNum, qboolean speaking );
 void CL_SetLocalSpeakingState( qboolean speaking );
 
+void CL_RefreshSteamIdentity( void );
+void CL_EnforceSteamIdentity( void );
+const char *CL_SteamIdentityName( void );
+qboolean CL_SteamIdentityNameLocked( void );
+
 
 //
 // cl_input.cpp
@@ -748,6 +753,7 @@ void CL_WebView_OnMouseMove( int x, int y );
 void CL_WebView_OnMouseButtonEvent( int key, qboolean down );
 void CL_WebView_OnMouseWheelEvent( int direction );
 void CL_WebView_OnKeyEvent( int key, qboolean down );
+void CL_WebView_OnCharEvent( int codepoint );
 qhandle_t CL_AdvertisementBridge_SetupAdvertCellShader( const char *defaultContent, const void *rect, int cellId );
 qhandle_t CL_AdvertisementBridge_RefreshAdvertCellShader( const char *defaultContent, const void *rect, int cellId );
 qhandle_t CL_AdvertisementBridge_SetupUIAdvertCellShader( const char *defaultContent, const void *rect, int cellId );

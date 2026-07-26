@@ -315,8 +315,15 @@ def default_tool_path() -> Path:
     configured = os.environ.get("FNQL_AUDIOZONESC")
     if configured:
         return Path(configured)
-    local = ROOT / "meson" / "build" / "win32" / "fnql-audiozonesc.exe"
-    return local if local.is_file() else Path("fnql-audiozonesc")
+    for relative in (
+        Path("meson/build/fnql-audiozonesc.exe"),
+        Path("meson/build/fnql-audiozonesc"),
+        Path("meson/build/win32/fnql-audiozonesc.exe"),
+    ):
+        local = ROOT / relative
+        if local.is_file():
+            return local
+    return Path("fnql-audiozonesc")
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:

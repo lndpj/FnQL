@@ -55,6 +55,7 @@ Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
 #include "../renderercommon/tr_ql_cvars.h"
 #include "../renderercommon/tr_global_fog.h"
 #include "../renderercommon/tr_liquid.h"
+#include "../renderercommon/tr_underwater.h"
 #include "tr_common.h"
 #include "iqm.h"
 
@@ -624,6 +625,11 @@ typedef struct {
 
 	int			numLiquidInteractions;
 	liquidInteraction_t liquidInteractions[LIQUID_MAX_ACTIVE_IMPULSES];
+
+	// Resolved submerged-view medium for this scene.  Zero contents or zero
+	// strength leaves the underwater compositor inactive for the view.
+	int			underwaterContents;
+	float		underwaterStrength;
 
 	int			numPolys;
 	struct srfPoly_s	*polys;
@@ -1915,6 +1921,7 @@ typedef struct {
 	qboolean screenMapDone;
 	qboolean doneBloom;
 	qboolean doneMotionBlur;
+	qboolean doneUnderwater;
 
 } backEndState_t;
 
@@ -2208,6 +2215,12 @@ extern cvar_t	*r_liquidRefraction;
 extern cvar_t	*r_liquidWarpScale;
 extern cvar_t	*r_liquidReflection;
 extern cvar_t	*r_liquidRipples;
+
+extern cvar_t	*r_underwater;			// opt-in submerged-view compositor
+extern cvar_t	*r_underwaterWarp;		// submerged screen warp amplitude
+extern cvar_t	*r_underwaterDispersion;	// submerged chromatic dispersion
+extern cvar_t	*r_underwaterFog;		// submerged depth absorption strength
+extern cvar_t	*r_underwaterVignette;		// submerged edge darkening
 extern cvar_t	*r_crt;
 extern cvar_t	*r_crtAmount;
 extern cvar_t	*r_crtScanlineStrength;
@@ -2688,6 +2701,7 @@ void RE_AddAdditiveLightToScene( const vec3_t org, float intensity, float r, flo
 void RE_AddLinearLightToScene( const vec3_t start, const vec3_t end, float intensity, float r, float g, float b );
 void AdvertisementBridge_UpdateLoadingViewParameters( void );
 void RE_AddLiquidInteractionToScene( const liquidInteraction_t *interaction );
+void RE_SetUnderwaterView( const underwaterView_t *view );
 #ifdef USE_PMLIGHT
 void R_DlightTest_f( void );
 #endif
